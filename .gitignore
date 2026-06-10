@@ -5,6 +5,7 @@ __pycache__/
 *.npz
 logs/
 scripts/miner.env
+scripts/gpu_test.env
 scripts/validator.env
 scripts/verifier.env
 scripts/label_matcher.env

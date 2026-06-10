@@ -4,8 +4,47 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+SCRIPT_DIR="$ROOT_DIR/scripts"
+
+DEFAULT_ENV_FILE="$SCRIPT_DIR/gpu_test.env"
+FALLBACK_ENV_FILE="$SCRIPT_DIR/miner.env"
+EXAMPLE_ENV_FILE="$SCRIPT_DIR/gpu_test.env.example"
+ENV_FILE="${PERTURB_ENV_FILE:-$DEFAULT_ENV_FILE}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --env-file)
+      if [[ $# -lt 2 ]]; then
+        echo "Usage: bash ./scripts/cloud_gpu_test.sh [--env-file PATH] [local_e2e_test.py args...]"
+        exit 1
+      fi
+      ENV_FILE="$2"
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ ! -f "$ENV_FILE" && "$ENV_FILE" == "$DEFAULT_ENV_FILE" && -f "$FALLBACK_ENV_FILE" ]]; then
+  ENV_FILE="$FALLBACK_ENV_FILE"
+fi
+
+if [[ -f "$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  echo "=== loaded env: $ENV_FILE ==="
+elif [[ -f "$EXAMPLE_ENV_FILE" ]]; then
+  echo "No env file found. Create one from template:"
+  echo "  cp \"$EXAMPLE_ENV_FILE\" \"$DEFAULT_ENV_FILE\""
+  echo "Continuing with built-in defaults..."
+else
+  echo "No env file found; continuing with built-in defaults..."
+fi
 
 export PERTURB_GPU_PROFILE="${PERTURB_GPU_PROFILE:-on}"
+export PERTURB_ATTACK_ALGORITHM="${PERTURB_ATTACK_ALGORITHM:-sma_mi_fgsm}"
 
 if [[ ! -d ".venv" ]]; then
   python3 -m venv .venv
@@ -25,7 +64,9 @@ if torch.cuda.is_available():
 PY
 
 echo ""
-echo "=== attack algorithm: \${PERTURB_ATTACK_ALGORITHM:-sma_mi_fgsm} ==="
+echo "=== attack profile ==="
+echo "algorithm=${PERTURB_ATTACK_ALGORITHM}"
+echo "gpu_profile=${PERTURB_GPU_PROFILE}"
 python scripts/local_e2e_test.py --skip-llm "$@"
 
 echo ""
