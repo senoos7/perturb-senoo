@@ -24,7 +24,6 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from perturbnet import constants as C
-from perturbnet.attacks import list_attack_algorithms, run_attack, runtime_profile_summary
 from perturbnet.image_io import decode_image_b64, encode_image_b64
 from perturbnet.model import (
     load_efficientnet_v2_l,
@@ -215,6 +214,20 @@ def _llm_verify(
     return bool(data["is_match"]), str(data.get("reason", ""))
 
 
+def _load_env_file(path: str) -> None:
+    with open(path, encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export ") :].strip()
+            value = value.strip().strip('"').strip("'")
+            os.environ[key] = value
+
+
 def _configure_attack_logging() -> None:
     log_mode = os.getenv("PERTURB_ATTACK_LOG", "on").strip().lower()
     if log_mode in {"0", "false", "no", "off"}:
@@ -228,7 +241,19 @@ def _configure_attack_logging() -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Local Perturb end-to-end test")
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument(
+        "--env-file",
+        default=os.getenv("PERTURB_ENV_FILE", ""),
+        help="Load attack env vars before importing algorithms (e.g. scripts/gpu_test_apgd_cw.env.example)",
+    )
+    pre_args, _ = pre.parse_known_args()
+    if pre_args.env_file:
+        _load_env_file(pre_args.env_file)
+
+    from perturbnet.attacks import list_attack_algorithms, run_attack, runtime_profile_summary
+
+    parser = argparse.ArgumentParser(description="Local Perturb end-to-end test", parents=[pre])
     parser.add_argument(
         "--image",
         default=os.path.join(ROOT, C.DEFAULT_TEST_IMAGE_RELATIVE_PATH),
@@ -251,10 +276,12 @@ def main() -> int:
         help="Skip LLM semantic verify (attack + score only)",
     )
     args = parser.parse_args()
+    os.environ["PERTURB_ATTACK_ALGORITHM"] = args.algorithm
     _configure_attack_logging()
 
     print("=== Perturb local end-to-end test ===")
     print(f"device={'cuda' if torch.cuda.is_available() else 'cpu'}")
+    print(f"algorithm={args.algorithm}")
     print(f"image={args.image}")
     print(f"prompt={args.prompt} epsilon={args.epsilon} min_delta={args.min_delta}")
     print()
@@ -286,10 +313,10 @@ def main() -> int:
         except requests.RequestException as exc:
             print(f"  LLM unavailable ({exc}); re-run with --skip-llm for attack-only test")
 
-    print(f"profile: {runtime_profile_summary()}")
+    print(f"profile: {runtime_profile_summary(args.algorithm)}")
     print(f"[4/5] Miner attack ({args.algorithm})")
     t0 = time.perf_counter()
-    result = run_attack(
+    attack_result = run_attack(
         clean=clean,
         model=model,
         target_index=target_index,
@@ -299,14 +326,14 @@ def main() -> int:
         algorithm=args.algorithm,
     )
     attack_ms = int((time.perf_counter() - t0) * 1000)
-    adv_b64 = encode_image_b64(result.adv)
+    adv_b64 = encode_image_b64(attack_result.adv)
     print(
-        f"  attack_time_ms={attack_ms} algorithm={result.algorithm_key} "
-        f"linf={result.linf:.6f} rmse={result.rmse:.6f} pred_idx={result.pred_index}"
+        f"  attack_time_ms={attack_ms} algorithm={attack_result.algorithm_key} "
+        f"linf={attack_result.linf:.6f} rmse={attack_result.rmse:.6f} pred_idx={attack_result.pred_index}"
     )
 
     print("[5/5] Validator score (verify_and_score)")
-    result = verify_and_score(
+    score_result = verify_and_score(
         model=model,
         device=device,
         clean_image_b64=clean_b64,
@@ -317,13 +344,13 @@ def main() -> int:
     )
     print(
         "  "
-        f"score={result.score:.6f} reason={result.reason} "
-        f"norm={result.norm:.6f} rmse={result.rmse:.6f} "
-        f"ssim={result.ssim:.6f} psnr_db={result.psnr_db:.4f} "
-        f"new_label={result.model_prediction}"
+        f"score={score_result.score:.6f} reason={score_result.reason} "
+        f"norm={score_result.norm:.6f} rmse={score_result.rmse:.6f} "
+        f"ssim={score_result.ssim:.6f} psnr_db={score_result.psnr_db:.4f} "
+        f"new_label={score_result.model_prediction}"
     )
     print()
-    if result.reason == "success":
+    if score_result.reason == "success":
         print("PASS: local end-to-end workflow succeeded.")
         return 0
     print("FAIL: attack or scoring gate failed.", file=sys.stderr)

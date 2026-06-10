@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging as pylogging
 import os
 import time
@@ -174,11 +175,23 @@ class PerturbMiner:
         self.metagraph.sync(subtensor=self.subtensor)
 
     async def forward(self, synapse: AttackChallenge) -> AttackChallenge:
+        task_id = getattr(synapse, "task_id", "unknown")
         self._log_step_start(
             "miner_forward",
-            task_id=getattr(synapse, "task_id", "unknown"),
+            task_id=task_id,
             norm_type=getattr(synapse, "norm_type", "unknown"),
             epsilon=getattr(synapse, "epsilon", "unknown"),
+        )
+        logger.info(
+            "[CHALLENGE_META] %s",
+            json.dumps(
+                {
+                    "task_id": task_id,
+                    "prompt": getattr(synapse, "prompt", "") or "",
+                    "true_label": getattr(synapse, "true_label", "") or "",
+                },
+                ensure_ascii=False,
+            ),
         )
         if synapse.norm_type != "Linf":
             logger.info(f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unsupported norm_type={synapse.norm_type}")

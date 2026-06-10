@@ -71,6 +71,8 @@ class TaskContext:
     task_id: str
     norm_type: str = "Linf"
     epsilon: float = 0.0
+    prompt: str = ""
+    true_label: str = ""
     shape: str = ""
     work_shape: str = ""
     uses_work: bool = False
@@ -328,8 +330,14 @@ def _format_task_message(ctx: TaskContext, *, linf: float, rmse: float, misclass
         "",
         "*Challenge*",
         f"• norm: `{ctx.norm_type}` epsilon: `{ctx.epsilon:.6f}` min_delta: `{ctx.min_delta:.6f}`",
-        f"• image: `{ctx.shape or 'unknown'}` work: `{ctx.work_shape or ctx.shape or 'unknown'}` uses_work={ctx.uses_work}",
     ]
+    if ctx.prompt:
+        lines.append(f"• prompt: `{ctx.prompt}`")
+    if ctx.true_label:
+        lines.append(f"• true_label: `{ctx.true_label}`")
+    lines.append(
+        f"• image: `{ctx.shape or 'unknown'}` work: `{ctx.work_shape or ctx.shape or 'unknown'}` uses_work={ctx.uses_work}"
+    )
     if ctx.full_pixels:
         lines.append(f"• full_pixels: `{ctx.full_pixels}`")
     if inter_task_s is not None:
@@ -559,6 +567,24 @@ def _handle_line(line: str, args: argparse.Namespace, state: ReporterState) -> N
             forward_ts=time.time(),
         )
         state.task_order.append(task_id)
+        return
+
+    if "[CHALLENGE_META]" in clean:
+        try:
+            payload = json.loads(clean.split("[CHALLENGE_META]", 1)[1].strip())
+        except (json.JSONDecodeError, IndexError):
+            return
+        task_id = str(payload.get("task_id", "") or "")
+        ctx = state.pending.get(task_id) if task_id else None
+        if ctx is None:
+            ctx = _latest_task(state)
+        if ctx is None and task_id:
+            ctx = TaskContext(task_id=task_id, forward_ts=time.time())
+            state.pending[task_id] = ctx
+            state.task_order.append(task_id)
+        if ctx is not None:
+            ctx.prompt = str(payload.get("prompt", "") or ctx.prompt)
+            ctx.true_label = str(payload.get("true_label", "") or ctx.true_label)
         return
 
     match = RE_ATTACK_START.search(clean)

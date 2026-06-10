@@ -2,7 +2,8 @@
 Attack algorithm registry and dispatcher.
 
 Select via environment variable:
-  PERTURB_ATTACK_ALGORITHM=sma_mi_fgsm   (default, implemented)
+  PERTURB_ATTACK_ALGORITHM=sma_mi_fgsm   (default)
+  PERTURB_ATTACK_ALGORITHM=apgd_cw      (APGD-DLR + C&W shrink)
   PERTURB_ATTACK_ALGORITHM=magi          (stub, not yet implemented)
 
 Add a new algorithm:
@@ -18,6 +19,7 @@ from typing import NamedTuple
 import torch
 
 from perturbnet.attacks.base import AttackResult, AttackRunner, ProfileSummaryFn
+from perturbnet.attacks import apgd_cw as apgd_cw_module
 from perturbnet.attacks import magi as magi_module
 from perturbnet.attacks import sma_mi_fgsm as sma_mi_fgsm_module
 
@@ -37,6 +39,9 @@ def _normalize_algorithm_key(raw: str) -> str:
         "sma": "sma_mi_fgsm",
         "smi_fgsm": "sma_mi_fgsm",
         "default": "sma_mi_fgsm",
+        "apgd": "apgd_cw",
+        "cw": "apgd_cw",
+        "apgd_dlr_cw": "apgd_cw",
     }
     return aliases.get(key, key)
 
@@ -47,6 +52,12 @@ _REGISTRY: dict[str, _RegisteredAttack] = {
         title=sma_mi_fgsm_module.ALGORITHM_NAME,
         runner=sma_mi_fgsm_module.run_sma_mi_fgsm,
         profile_summary=sma_mi_fgsm_module.runtime_profile_summary,
+    ),
+    "apgd_cw": _RegisteredAttack(
+        key="apgd_cw",
+        title=apgd_cw_module.ALGORITHM_NAME,
+        runner=apgd_cw_module.run_apgd_cw,
+        profile_summary=apgd_cw_module.runtime_profile_summary,
     ),
     "magi": _RegisteredAttack(
         key="magi",
@@ -80,8 +91,8 @@ def get_attack_algorithm_name() -> str:
     return resolve_attack_algorithm().title
 
 
-def runtime_profile_summary() -> str:
-    attack = resolve_attack_algorithm()
+def runtime_profile_summary(algorithm: str | None = None) -> str:
+    attack = resolve_attack_algorithm(algorithm)
     return f"algorithm={attack.key} title={attack.title} {attack.profile_summary()}"
 
 
