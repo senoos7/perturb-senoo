@@ -20,12 +20,19 @@ Phase 2 — Carlini & Wagner minimum-distortion search (Carlini & Wagner,
           subnet's min_delta (the 1/255 floor), which is what the validator
           score rewards quadratically.
 
-Phase 3 — 8-bit snap + gate re-verification (match validator PNG round-trip).
+Phase 2.5 — SMA-style shrink + prune refine (reuse sma_mi_fgsm helpers):
+          scale the perturbation direction to minimize L∞, then zero low-magnitude
+          pixels to cut RMSE and restore SSIM. Uses all budget remaining after
+          Phase 2 until the global deadline.
+
+Phase 3 — project to full resolution, optional full-res refine, 8-bit snap +
+          gate re-verification (match validator PNG round-trip).
 
 Budget
 ------
-Set PERTURB_ATTACK_BUDGET_MS (default 13000 on GPU). Phases split by
-APGD_CW_PHASE1_FRAC / APGD_CW_PHASE2_FRAC; the remainder is snap + safety.
+Set PERTURB_ATTACK_BUDGET_MS (default 13000 on GPU). Phase 1 discovery and
+Phase 2 binary shrink are capped by APGD_CW_PHASE1_FRAC / APGD_CW_PHASE2_FRAC;
+Phase 2.5 refine consumes the remainder until the deadline.
 
 Switch on with PERTURB_ATTACK_ALGORITHM=apgd_cw.
 """
@@ -39,6 +46,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn.functional as F
 
+from perturbnet.attacks import sma_mi_fgsm as sma
 from perturbnet.image_io import quantize_chw_to_8bit
 from perturbnet.model import logits_for_images, predict_index
 
@@ -113,7 +121,7 @@ def _attack_log_mode() -> str:
 # --- tunables (env) ---------------------------------------------------------
 _MAX_LINF_DELTA = float(os.getenv("PERTURB_MAX_LINF_DELTA", "0.03"))
 _PHASE1_FRAC = float(os.getenv("APGD_CW_PHASE1_FRAC", "0.25"))
-_PHASE2_FRAC = float(os.getenv("APGD_CW_PHASE2_FRAC", "0.65"))
+_PHASE2_FRAC = float(os.getenv("APGD_CW_PHASE2_FRAC", "0.20"))
 _MOMENTUM = float(os.getenv("APGD_CW_MOMENTUM", "0.75"))
 _INIT_STEP_MULT = float(os.getenv("APGD_CW_INIT_STEP", "2.0"))
 _CHECKPOINT_RHO = float(os.getenv("APGD_CW_CHECKPOINT_RHO", "0.75"))
@@ -193,6 +201,58 @@ class _Clock:
         if self.log_mode == "off":
             return
         logger.info("[APGD-CW] phase=%s %s", name, _format_fields(**self._timing(), **fields))
+
+
+@dataclass
+class _RefineContext:
+    """Minimal _AttackContext stand-in for SMA shrink/prune helpers."""
+
+    clock: _Clock
+    _progress_marks: dict[str, int] = field(default_factory=dict)
+
+    def exceeded(self) -> bool:
+        return self.clock.exceeded()
+
+    def should_stop(self, quality: tuple[float, float] | None) -> bool:
+        if self.clock.exceeded():
+            return True
+        if _EARLY_STOP_OPTIMAL and quality is not None and quality[0] <= _OPTIMAL_LINF:
+            return True
+        return False
+
+    def _timing_fields(self) -> dict[str, object]:
+        return self.clock._timing()
+
+    def phase(self, name: str, **fields: object) -> None:
+        self.clock.phase(name, **fields)
+
+    def event(self, message: str, **fields: object) -> None:
+        self.clock.event(message, **fields)
+
+    def progress(self, phase: str, current: int, total: int, **fields: object) -> None:
+        if self.clock.log_mode == "off" or total <= 0:
+            return
+        pct = int(100 * current / total)
+        interval = 10 if self.clock.log_mode == "verbose" else 10
+        mark = (pct // interval) * interval
+        if mark <= 0 or mark >= 100:
+            return
+        last = self._progress_marks.get(phase, -1)
+        if mark <= last:
+            return
+        self._progress_marks[phase] = mark
+        self.clock.phase(
+            phase,
+            progress_pct=mark,
+            current=current,
+            total=total,
+            **fields,
+        )
+
+    def quality_fields(self, quality: tuple[float, float] | None) -> dict[str, object]:
+        if quality is None:
+            return {"success": False}
+        return {"success": True, "linf": quality[0], "rmse": quality[1]}
 
 
 # --- work scale (downscale core loops, upsample delta) ----------------------
@@ -498,6 +558,69 @@ def _snap_8bit(
     return adv
 
 
+def _outcome_from_adv(
+    *,
+    clean: torch.Tensor,
+    model: torch.nn.Module,
+    target_index: int,
+    min_delta: float,
+    adv: torch.Tensor,
+    fallback: _ApgdOutcome,
+) -> _ApgdOutcome:
+    pred = predict_index(model=model, image_chw=adv)
+    linf = _linf_delta(clean, adv)
+    rmse = _rmse(clean, adv)
+    if pred != target_index and linf >= min_delta:
+        return _ApgdOutcome(adv=adv, success=True, linf=linf, rmse=rmse, pred_index=pred)
+    return fallback
+
+
+def _refine_outcome(
+    *,
+    clean: torch.Tensor,
+    model: torch.nn.Module,
+    target_index: int,
+    min_delta: float,
+    outcome: _ApgdOutcome,
+    clock: _Clock,
+    label: str,
+) -> _ApgdOutcome:
+    if not outcome.success:
+        clock.phase(f"{label}_skip", reason="no_success")
+        return outcome
+    if clock.exceeded():
+        clock.phase(f"{label}_skip", reason="time_budget")
+        return outcome
+
+    clock.phase(f"{label}_start", linf=outcome.linf, rmse=outcome.rmse)
+    refine_ctx = _RefineContext(clock=clock)
+    refined = sma._refine_candidate(
+        clean=clean,
+        adv=outcome.adv,
+        model=model,
+        target_index=target_index,
+        min_delta=min_delta,
+        ctx=refine_ctx,  # type: ignore[arg-type]
+        label=label,
+    )
+    refined_outcome = _outcome_from_adv(
+        clean=clean,
+        model=model,
+        target_index=target_index,
+        min_delta=min_delta,
+        adv=refined,
+        fallback=outcome,
+    )
+    clock.phase(
+        f"{label}_done",
+        linf=refined_outcome.linf,
+        rmse=refined_outcome.rmse,
+        pred_idx=refined_outcome.pred_index,
+        kept=refined_outcome is not outcome,
+    )
+    return refined_outcome
+
+
 # --- public runner ----------------------------------------------------------
 def run_apgd_cw(
     *,
@@ -575,13 +698,45 @@ def run_apgd_cw(
         clock.phase("shrink_skip", reason="no_discovery")
         best = phase1
 
-    # PHASE 3: project to full resolution, snap to 8-bit, verify gates.
+    # PHASE 2.5: shrink + prune refine on work resolution (uses remaining budget).
+    best = _refine_outcome(
+        clean=clean_work,
+        model=model,
+        target_index=target_index,
+        min_delta=min_delta,
+        outcome=best,
+        clock=clock,
+        label="work_refine",
+    )
+
+    # PHASE 3: project to full resolution, optional full-res refine, snap, verify.
     adv_full = work.project_adv_to_full(best.adv, effective_eps)
-    if work.uses_work:
-        full_pred = predict_index(model=model, image_chw=adv_full)
-        full_linf = _linf_delta(clean, adv_full)
-        if full_pred == target_index or full_linf < min_delta:
-            clock.event("full_res_miss_after_project", full_pred=full_pred, full_linf=full_linf)
+    full_quality = sma._attack_quality(model, clean, adv_full, target_index, min_delta)
+    if work.uses_work and full_quality is None:
+        clock.event("full_res_miss_after_project")
+
+    if (
+        full_quality is not None
+        and work.full_pixels <= sma._FULL_REFINE_MAX_PIXELS
+        and not clock.exceeded()
+    ):
+        adv_full = sma._refine_candidate(
+            clean=clean,
+            adv=adv_full,
+            model=model,
+            target_index=target_index,
+            min_delta=min_delta,
+            ctx=_RefineContext(clock=clock),  # type: ignore[arg-type]
+            label="full_refine",
+        )
+    elif full_quality is not None:
+        adv_full = _snap_8bit(
+            clean=clean,
+            adv=adv_full,
+            model=model,
+            target_index=target_index,
+            min_delta=min_delta,
+        )
 
     snapped = _snap_8bit(
         clean=clean,
