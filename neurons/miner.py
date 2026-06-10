@@ -59,20 +59,48 @@ def _make_subtensor(config):
         return subtensor_cls(config=config)
 
 
+def _resolve_axon_port(config: typing.Any) -> int:
+    """bt.config() defaults axon.port to 8091; prefer MINER_PORT / CLI override."""
+    for raw in (
+        os.getenv("MINER_PORT"),
+        os.getenv("AXON_PORT"),
+        getattr(config, "axon_port", None),
+    ):
+        if raw is not None and str(raw).strip():
+            return int(raw)
+    axon_port = getattr(getattr(config, "axon", None), "port", None)
+    if axon_port is not None:
+        return int(axon_port)
+    return 9000
+
+
 def _make_axon(wallet, config):
     resolved_config = config() if callable(config) else config
+    port = _resolve_axon_port(resolved_config)
+    if hasattr(resolved_config, "axon"):
+        resolved_config.axon.port = port
     if hasattr(bt, "axon"):
         try:
-            return bt.axon(wallet=wallet, config=resolved_config)
+            return bt.axon(wallet=wallet, port=port, config=resolved_config)
+        except TypeError:
+            try:
+                return bt.axon(wallet=wallet, config=resolved_config)
+            except Exception:
+                return bt.axon(wallet=wallet, port=port)
         except Exception:
-            return bt.axon(wallet=wallet)
+            return bt.axon(wallet=wallet, port=port)
     axon_cls = getattr(bt, "Axon", None)
     if axon_cls is None:
         raise RuntimeError("No axon constructor found in bittensor.")
     try:
-        return axon_cls(wallet=wallet, config=resolved_config)
+        return axon_cls(wallet=wallet, port=port, config=resolved_config)
+    except TypeError:
+        try:
+            return axon_cls(wallet=wallet, config=resolved_config)
+        except Exception:
+            return axon_cls(wallet=wallet, port=port)
     except Exception:
-        return axon_cls(wallet=wallet)
+        return axon_cls(wallet=wallet, port=port)
 
 
 def _configure_log_level(level_raw: str) -> None:
@@ -233,7 +261,8 @@ class PerturbMiner:
             raise RuntimeError("Miner hotkey is not registered on this netuid.")
 
         logger.info(
-            f"Serving miner axon {self.axon} on network: {self.config.subtensor.network} with netuid: {self.config.netuid}"
+            f"Serving miner axon {self.axon} on network: {self.config.subtensor.network} "
+            f"with netuid: {self.config.netuid} axon_port={getattr(self.config.axon, 'port', 'unknown')}"
         )
         self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
         self.axon.start()
@@ -288,7 +317,7 @@ def build_config() -> typing.Any:
 
     if not hasattr(config, "axon"):
         config.axon = type("AxonConfig", (), {})()
-    config.axon.port = int(getattr(config.axon, "port", getattr(config, "axon_port", 9000)))
+    config.axon.port = _resolve_axon_port(config)
 
     config.log_level = getattr(config, "log_level", os.getenv("LOG_LEVEL", "DEBUG"))
 
