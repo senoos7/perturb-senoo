@@ -10,4 +10,5 @@ scripts/validator.env
 scripts/verifier.env
 scripts/label_matcher.env
 scripts/llm_endpoint.env
+scripts/miner_slack.env
 
