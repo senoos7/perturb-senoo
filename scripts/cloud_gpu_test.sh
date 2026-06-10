@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Run on cloud GPU server after upload. Prints metrics to share back.
+# Default test image: assets/pexels-photo-2014422.jpg (Pexels medium, 350x350).
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -66,6 +66,8 @@ PROMPTS = (
 VALIDATOR_STATE_FILENAME = "perturb_validator_state.json"
 FALLBACK_IMAGE_RELATIVE_PATH = "assets/dog_1.jpg"
 FALLBACK_LABEL = "dog"
+# Default local/GPU test image: Pexels medium variant (~350px), typical production size.
+DEFAULT_TEST_IMAGE_RELATIVE_PATH = "assets/pexels-photo-2014422.jpg"
 
 # Validator runtime constants.
 IMAGE_ENDPOINT = os.getenv("PERTURB_IMAGE_ENDPOINT", "https://api.pexels.com/v1/search")

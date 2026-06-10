@@ -231,8 +231,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Local Perturb end-to-end test")
     parser.add_argument(
         "--image",
-        default=os.path.join(ROOT, C.FALLBACK_IMAGE_RELATIVE_PATH),
-        help="Path to challenge image (default: assets/dog_1.jpg)",
+        default=os.path.join(ROOT, C.DEFAULT_TEST_IMAGE_RELATIVE_PATH),
+        help="Path to challenge image (default: assets/pexels-photo-2014422.jpg, Pexels medium)",
     )
     parser.add_argument("--prompt", default=C.FALLBACK_LABEL, help="Broad label for LLM verify")
     parser.add_argument("--epsilon", type=float, default=0.12, help="Challenge epsilon")
