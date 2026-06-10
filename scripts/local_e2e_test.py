@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import logging
 import math
 import os
 import sys
@@ -214,6 +215,18 @@ def _llm_verify(
     return bool(data["is_match"]), str(data.get("reason", ""))
 
 
+def _configure_attack_logging() -> None:
+    log_mode = os.getenv("PERTURB_ATTACK_LOG", "on").strip().lower()
+    if log_mode in {"0", "false", "no", "off"}:
+        return
+    level = logging.DEBUG if log_mode in {"verbose", "debug", "v"} else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(message)s",
+        force=True,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Local Perturb end-to-end test")
     parser.add_argument(
@@ -238,6 +251,7 @@ def main() -> int:
         help="Skip LLM semantic verify (attack + score only)",
     )
     args = parser.parse_args()
+    _configure_attack_logging()
 
     print("=== Perturb local end-to-end test ===")
     print(f"device={'cuda' if torch.cuda.is_available() else 'cpu'}")

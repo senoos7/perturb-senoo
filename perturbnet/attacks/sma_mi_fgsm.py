@@ -30,9 +30,10 @@ Post-processing
 """
 from __future__ import annotations
 
+import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
@@ -40,9 +41,11 @@ import torch.nn.functional as F
 from perturbnet.image_io import quantize_chw_to_8bit
 from perturbnet.model import logits_for_images, predict_index
 
+logger = logging.getLogger(__name__)
 ALGORITHM_NAME = "SMA-MI-FGSM"
 _ONE_STEP = 1.0 / 255.0
 _OPTIMAL_LINF = _ONE_STEP + 1e-6
+_PROGRESS_INTERVAL_PCT = 25
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -100,6 +103,27 @@ _EARLY_STOP_OPTIMAL = _env_bool("PERTURB_ATTACK_EARLY_STOP", default=True)
 _ATTACK_BUDGET_MS = _attack_budget_ms()
 
 
+def _attack_log_mode() -> str:
+    raw = os.getenv("PERTURB_ATTACK_LOG", "on").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return "off"
+    if raw in {"verbose", "debug", "v"}:
+        return "verbose"
+    return "on"
+
+
+def _format_fields(**fields: object) -> str:
+    parts: list[str] = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        if isinstance(value, float):
+            parts.append(f"{key}={value:.6f}")
+        else:
+            parts.append(f"{key}={value}")
+    return " ".join(parts)
+
+
 @dataclass
 class _AttackBudget:
     deadline: float | None
@@ -120,6 +144,85 @@ class _AttackBudget:
         if self.early_stop_optimal and _is_optimal_quality(quality):
             return True
         return False
+
+
+@dataclass
+class _AttackContext:
+    budget: _AttackBudget
+    started_at: float
+    log_mode: str = field(default_factory=_attack_log_mode)
+    _progress_marks: dict[str, int] = field(default_factory=dict)
+
+    @classmethod
+    def from_env(cls) -> _AttackContext:
+        return cls(budget=_AttackBudget.from_env(), started_at=time.perf_counter())
+
+    def elapsed_ms(self) -> int:
+        return int((time.perf_counter() - self.started_at) * 1000)
+
+    def remaining_ms(self) -> int | None:
+        if self.budget.deadline is None:
+            return None
+        return max(0, int((self.budget.deadline - time.perf_counter()) * 1000))
+
+    def exceeded(self) -> bool:
+        return self.budget.exceeded()
+
+    def should_stop(self, quality: tuple[float, float] | None) -> bool:
+        return self.budget.should_stop(quality)
+
+    def _timing_fields(self) -> dict[str, object]:
+        fields: dict[str, object] = {"elapsed_ms": self.elapsed_ms()}
+        remaining = self.remaining_ms()
+        if remaining is not None:
+            fields["remaining_ms"] = remaining
+        return fields
+
+    def phase(self, name: str, **fields: object) -> None:
+        if self.log_mode == "off":
+            return
+        payload = _format_fields(**self._timing_fields(), **fields)
+        logger.info("[SMA-MI-FGSM] phase=%s %s", name, payload)
+
+    def event(self, message: str, **fields: object) -> None:
+        if self.log_mode == "off":
+            return
+        payload = _format_fields(**self._timing_fields(), **fields)
+        logger.info("[SMA-MI-FGSM] %s %s", message, payload)
+
+    def progress(self, phase: str, current: int, total: int, **fields: object) -> None:
+        if self.log_mode == "off" or total <= 0:
+            return
+        pct = int(100 * current / total)
+        interval = 10 if self.log_mode == "verbose" else _PROGRESS_INTERVAL_PCT
+        mark = (pct // interval) * interval
+        if mark <= 0 or mark >= 100:
+            return
+        last = self._progress_marks.get(phase, -1)
+        if mark <= last:
+            return
+        self._progress_marks[phase] = mark
+        payload = _format_fields(
+            **self._timing_fields(),
+            progress_pct=mark,
+            current=current,
+            total=total,
+            **fields,
+        )
+        logger.info("[SMA-MI-FGSM] phase=%s %s", phase, payload)
+
+    def quality_fields(self, quality: tuple[float, float] | None) -> dict[str, object]:
+        if quality is None:
+            return {"success": False}
+        return {"success": True, "linf": quality[0], "rmse": quality[1]}
+
+
+def _stop_reason(ctx: _AttackContext, quality: tuple[float, float] | None) -> str:
+    if _is_optimal_quality(quality):
+        return "optimal_linf"
+    if ctx.exceeded():
+        return "time_budget"
+    return "complete"
 
 
 # --- metrics ----------------------------------------------------------------
@@ -213,17 +316,22 @@ def _try_sparse_pixel_attack(
     target_index: int,
     min_delta: float,
     order: torch.Tensor,
-    budget: _AttackBudget,
-) -> torch.Tensor | None:
+    ctx: _AttackContext,
+) -> tuple[torch.Tensor | None, str]:
     """Single-pixel ±1/255 search on top-K salient locations (lowest RMSE path)."""
-    channels, height, width = clean.shape
+    _, height, width = clean.shape
     topk = min(_SPARSE_TOPK, order.numel())
     best: torch.Tensor | None = None
     best_quality: tuple[float, float] | None = None
+    stop_reason = "exhausted"
+
+    ctx.phase("sparse_start", topk=topk, pixels=f"{height}x{width}")
 
     for rank in range(topk):
-        if budget.exceeded():
+        if ctx.exceeded():
+            stop_reason = "time_budget"
             break
+        ctx.progress("sparse", rank + 1, topk, **ctx.quality_fields(best_quality))
         flat_idx = int(order[rank].item())
         channel = flat_idx // (height * width)
         spatial = flat_idx % (height * width)
@@ -239,9 +347,17 @@ def _try_sparse_pixel_attack(
             if _better_quality(quality, best_quality):
                 best = candidate
                 best_quality = quality
+                ctx.event("sparse_improved", rank=rank + 1, **ctx.quality_fields(best_quality))
                 if _is_optimal_quality(quality):
-                    return best
-    return best
+                    stop_reason = "optimal_linf"
+                    ctx.event("sparse_optimal_hit", rank=rank + 1, **ctx.quality_fields(best_quality))
+                    return best, stop_reason
+
+    if best is None:
+        ctx.phase("sparse_done", result="miss")
+    else:
+        ctx.phase("sparse_done", result="hit", **ctx.quality_fields(best_quality), stop=stop_reason)
+    return best, stop_reason
 
 
 # --- MI-FGSM core -----------------------------------------------------------
@@ -257,19 +373,32 @@ def _mi_fgsm_untargeted(
     noise_scale: float,
     saliency_mask: torch.Tensor | None,
     min_delta: float,
-    budget: _AttackBudget,
-) -> torch.Tensor:
+    ctx: _AttackContext,
+    restart_idx: int,
+) -> tuple[torch.Tensor, str]:
     adv = clean.clone().detach()
+    masked = saliency_mask is not None
     if noise_scale > 0.0:
         adv = adv + torch.empty_like(adv).uniform_(-noise_scale, noise_scale)
         adv = torch.max(torch.min(adv, clean + epsilon), clean - epsilon).clamp(0.0, 1.0)
 
+    ctx.phase(
+        "mi_fgsm_start",
+        restart=restart_idx,
+        steps=steps,
+        masked=masked,
+        noise=noise_scale > 0.0,
+    )
+
     velocity = torch.zeros_like(clean)
     target = torch.tensor([target_index], device=clean.device)
+    stop_reason = "max_steps"
 
-    for _ in range(steps):
-        if budget.exceeded():
+    for step_idx in range(steps):
+        if ctx.exceeded():
+            stop_reason = "time_budget"
             break
+        ctx.progress("mi_fgsm", step_idx + 1, steps, restart=restart_idx)
         adv.requires_grad_(True)
         logits = logits_for_images(model=model, image_bchw=adv.unsqueeze(0))
         loss = F.cross_entropy(logits, target)
@@ -284,9 +413,26 @@ def _mi_fgsm_untargeted(
         adv = torch.max(torch.min(adv, clean + epsilon), clean - epsilon).clamp(0.0, 1.0)
 
         if _is_success(model, clean, adv, target_index, min_delta=min_delta):
+            stop_reason = "success"
+            quality = _attack_quality(model, clean, adv, target_index, min_delta)
+            ctx.event(
+                "mi_fgsm_success",
+                restart=restart_idx,
+                step=step_idx + 1,
+                **ctx.quality_fields(quality),
+            )
             break
 
-    return adv.detach()
+    if stop_reason == "max_steps":
+        linf = _linf_delta(clean, adv)
+        ctx.phase(
+            "mi_fgsm_done",
+            restart=restart_idx,
+            result="no_success",
+            linf=linf,
+            stop=stop_reason,
+        )
+    return adv.detach(), stop_reason
 
 
 # --- binary shrink (minimize L∞) --------------------------------------------
@@ -297,19 +443,23 @@ def _shrink_perturbation(
     model: torch.nn.Module,
     target_index: int,
     min_delta: float,
-    budget: _AttackBudget,
+    ctx: _AttackContext,
+    label: str,
 ) -> torch.Tensor:
     if not _is_success(model, clean, adv, target_index, min_delta):
+        ctx.phase(f"{label}_skip", reason="not_success")
         return adv
 
     delta = adv - clean
     lo, hi = 0.0, 1.0
     best = adv
     best_quality = _attack_quality(model, clean, adv, target_index, min_delta)
+    ctx.phase(f"{label}_start", iters=_SHRINK_ITERATIONS, **ctx.quality_fields(best_quality))
 
-    for _ in range(_SHRINK_ITERATIONS):
-        if budget.exceeded():
+    for iter_idx in range(_SHRINK_ITERATIONS):
+        if ctx.exceeded():
             break
+        ctx.progress(label, iter_idx + 1, _SHRINK_ITERATIONS, **ctx.quality_fields(best_quality))
         mid = (lo + hi) / 2.0
         candidate = (clean + mid * delta).clamp(0.0, 1.0)
         linf = _linf_delta(clean, candidate)
@@ -323,10 +473,12 @@ def _shrink_perturbation(
                 best = candidate.clone()
                 best_quality = quality
                 if _is_optimal_quality(best_quality):
+                    ctx.event(f"{label}_optimal", **ctx.quality_fields(best_quality))
                     break
         else:
             lo = mid
 
+    ctx.phase(f"{label}_done", **ctx.quality_fields(best_quality))
     return best
 
 
@@ -338,9 +490,11 @@ def _prune_perturbation(
     model: torch.nn.Module,
     target_index: int,
     min_delta: float,
-    budget: _AttackBudget,
+    ctx: _AttackContext,
+    label: str,
 ) -> torch.Tensor:
     if not _is_success(model, clean, adv, target_index, min_delta):
+        ctx.phase(f"{label}_skip", reason="not_success")
         return adv
 
     delta = adv - clean
@@ -350,13 +504,20 @@ def _prune_perturbation(
     best = adv
     best_quality = _attack_quality(model, clean, adv, target_index, min_delta)
     chunk = max(1, (height * width) // _PRUNE_CHUNKS)
+    total_steps = max(1, len(range(chunk, height * width, chunk)))
 
     if _is_optimal_quality(best_quality):
+        ctx.phase(f"{label}_skip", reason="already_optimal", **ctx.quality_fields(best_quality))
         return best
 
+    ctx.phase(f"{label}_start", chunks=_PRUNE_CHUNKS, chunk_pixels=chunk, **ctx.quality_fields(best_quality))
+    step_idx = 0
+
     for zero_count in range(chunk, height * width, chunk):
-        if budget.exceeded():
+        if ctx.exceeded():
             break
+        step_idx += 1
+        ctx.progress(label, step_idx, total_steps, **ctx.quality_fields(best_quality))
         keep = torch.ones(height * width, device=clean.device)
         keep[order[:zero_count]] = 0.0
         keep = keep.view(height, width)
@@ -365,11 +526,14 @@ def _prune_perturbation(
         if _better_quality(quality, best_quality):
             best = candidate
             best_quality = quality
+            ctx.event(f"{label}_improved", zero_pixels=zero_count, **ctx.quality_fields(best_quality))
             if _is_optimal_quality(best_quality):
+                ctx.event(f"{label}_optimal", **ctx.quality_fields(best_quality))
                 break
         elif zero_count > chunk:
             break
 
+    ctx.phase(f"{label}_done", **ctx.quality_fields(best_quality))
     return best
 
 
@@ -380,31 +544,61 @@ def _refine_candidate(
     model: torch.nn.Module,
     target_index: int,
     min_delta: float,
-    budget: _AttackBudget,
+    ctx: _AttackContext,
+    label: str,
 ) -> torch.Tensor:
     """Shrink → prune → shrink → 8-bit snap (RMSE-focused post-processing)."""
-    if budget.exceeded():
+    ctx.phase(f"{label}_refine_start")
+    if ctx.exceeded():
+        ctx.event(f"{label}_refine_skip", reason="time_budget")
         return adv
     candidate = _shrink_perturbation(
-        clean=clean, adv=adv, model=model, target_index=target_index, min_delta=min_delta, budget=budget
+        clean=clean,
+        adv=adv,
+        model=model,
+        target_index=target_index,
+        min_delta=min_delta,
+        ctx=ctx,
+        label=f"{label}_shrink1",
     )
-    if budget.should_stop(_attack_quality(model, clean, candidate, target_index, min_delta)):
+    quality = _attack_quality(model, clean, candidate, target_index, min_delta)
+    if ctx.should_stop(quality):
+        ctx.event(f"{label}_refine_early_stop", stage="shrink1", **ctx.quality_fields(quality))
         return _snap_8bit(
             clean=clean, adv=candidate, model=model, target_index=target_index, min_delta=min_delta
         )
     candidate = _prune_perturbation(
-        clean=clean, adv=candidate, model=model, target_index=target_index, min_delta=min_delta, budget=budget
+        clean=clean,
+        adv=candidate,
+        model=model,
+        target_index=target_index,
+        min_delta=min_delta,
+        ctx=ctx,
+        label=f"{label}_prune",
     )
-    if budget.should_stop(_attack_quality(model, clean, candidate, target_index, min_delta)):
+    quality = _attack_quality(model, clean, candidate, target_index, min_delta)
+    if ctx.should_stop(quality):
+        ctx.event(f"{label}_refine_early_stop", stage="prune", **ctx.quality_fields(quality))
         return _snap_8bit(
             clean=clean, adv=candidate, model=model, target_index=target_index, min_delta=min_delta
         )
     candidate = _shrink_perturbation(
-        clean=clean, adv=candidate, model=model, target_index=target_index, min_delta=min_delta, budget=budget
+        clean=clean,
+        adv=candidate,
+        model=model,
+        target_index=target_index,
+        min_delta=min_delta,
+        ctx=ctx,
+        label=f"{label}_shrink2",
     )
-    return _snap_8bit(
+    candidate = _snap_8bit(
         clean=clean, adv=candidate, model=model, target_index=target_index, min_delta=min_delta
     )
+    ctx.phase(
+        f"{label}_refine_done",
+        **ctx.quality_fields(_attack_quality(model, clean, candidate, target_index, min_delta)),
+    )
+    return candidate
 
 
 # --- candidate selection ----------------------------------------------------
@@ -437,11 +631,25 @@ def _finalize(
     target_index: int,
     min_delta: float,
     device: torch.device,
+    ctx: _AttackContext,
+    stop_reason: str,
 ) -> tuple[torch.Tensor, float, float, int]:
     best = _snap_8bit(
         clean=clean, adv=best, model=model, target_index=target_index, min_delta=min_delta
     )
-    return best.to(device), _linf_delta(clean, best), _rmse(clean, best), predict_index(model=model, image_chw=best)
+    linf = _linf_delta(clean, best)
+    rmse = _rmse(clean, best)
+    pred_idx = predict_index(model=model, image_chw=best)
+    ctx.event(
+        "done",
+        stop=stop_reason,
+        linf=linf,
+        rmse=rmse,
+        pred_idx=pred_idx,
+        target_idx=target_index,
+        misclassified=pred_idx != target_index,
+    )
+    return best.to(device), linf, rmse, pred_idx
 
 
 # --- public entry point -----------------------------------------------------
@@ -460,26 +668,42 @@ def run_sma_mi_fgsm(
     Stops early when PERTURB_ATTACK_BUDGET_MS is exhausted or when a successful
     candidate reaches the 8-bit L∞ floor (1/255).
     """
-    budget = _AttackBudget.from_env()
+    ctx = _AttackContext.from_env()
     effective_eps = _effective_epsilon(epsilon)
     step_size = max(effective_eps / 10.0, _ONE_STEP)
     steps = max(10, _DEFAULT_STEPS)
     restarts = max(1, _DEFAULT_RESTARTS)
+    stop_reason = "complete"
+
+    ctx.event(
+        "start",
+        image_shape=tuple(clean.shape),
+        target_idx=target_index,
+        epsilon=epsilon,
+        effective_epsilon=effective_eps,
+        min_delta=min_delta,
+        steps=steps,
+        restarts=restarts,
+        budget_ms=_ATTACK_BUDGET_MS if _ATTACK_BUDGET_MS is not None else "unlimited",
+        log_mode=ctx.log_mode,
+    )
 
     best = clean.clone()
     best_quality: tuple[float, float] | None = None
     best_pred = target_index
 
+    ctx.phase("saliency_start")
     saliency_order = _saliency_order(clean, model, target_index)
     saliency_mask = _build_saliency_mask_from_order(saliency_order, clean.shape, clean.device)
+    ctx.phase("saliency_done", saliency_pixels=saliency_order.numel())
 
-    sparse = _try_sparse_pixel_attack(
+    sparse, _sparse_stop = _try_sparse_pixel_attack(
         clean=clean,
         model=model,
         target_index=target_index,
         min_delta=min_delta,
         order=saliency_order,
-        budget=budget,
+        ctx=ctx,
     )
     if sparse is not None:
         sparse = _refine_candidate(
@@ -488,7 +712,8 @@ def run_sma_mi_fgsm(
             model=model,
             target_index=target_index,
             min_delta=min_delta,
-            budget=budget,
+            ctx=ctx,
+            label="sparse",
         )
         best, best_quality, best_pred = _consider_candidate(
             clean=clean,
@@ -500,7 +725,10 @@ def run_sma_mi_fgsm(
             best_quality=best_quality,
             best_pred=best_pred,
         )
-        if budget.should_stop(best_quality):
+        ctx.event("best_updated", source="sparse", pred_idx=best_pred, **ctx.quality_fields(best_quality))
+        if ctx.should_stop(best_quality):
+            stop_reason = _stop_reason(ctx, best_quality)
+            ctx.event("early_stop", reason=stop_reason, stage="sparse", **ctx.quality_fields(best_quality))
             return _finalize(
                 clean=clean,
                 best=best,
@@ -508,13 +736,17 @@ def run_sma_mi_fgsm(
                 target_index=target_index,
                 min_delta=min_delta,
                 device=device,
+                ctx=ctx,
+                stop_reason=stop_reason,
             )
 
     for restart in range(restarts):
-        if budget.should_stop(best_quality):
+        if ctx.should_stop(best_quality):
+            stop_reason = _stop_reason(ctx, best_quality)
+            ctx.event("early_stop", reason=stop_reason, stage=f"before_restart_{restart}")
             break
         noise_scale = effective_eps if restart > 0 else 0.0
-        raw = _mi_fgsm_untargeted(
+        raw, mi_stop = _mi_fgsm_untargeted(
             clean=clean,
             model=model,
             target_index=target_index,
@@ -525,9 +757,12 @@ def run_sma_mi_fgsm(
             noise_scale=noise_scale,
             saliency_mask=saliency_mask if restart == 0 else None,
             min_delta=min_delta,
-            budget=budget,
+            ctx=ctx,
+            restart_idx=restart,
         )
-        if budget.exceeded():
+        if ctx.exceeded():
+            stop_reason = "time_budget"
+            ctx.event("early_stop", reason=stop_reason, stage=f"restart_{restart}_mi_fgsm", mi_stop=mi_stop)
             break
         candidate = _refine_candidate(
             clean=clean,
@@ -535,8 +770,10 @@ def run_sma_mi_fgsm(
             model=model,
             target_index=target_index,
             min_delta=min_delta,
-            budget=budget,
+            ctx=ctx,
+            label=f"restart_{restart}",
         )
+        prev_quality = best_quality
         best, best_quality, best_pred = _consider_candidate(
             clean=clean,
             candidate=candidate,
@@ -547,8 +784,23 @@ def run_sma_mi_fgsm(
             best_quality=best_quality,
             best_pred=best_pred,
         )
-        if budget.should_stop(best_quality):
+        if best_quality != prev_quality:
+            ctx.event(
+                "best_updated",
+                source=f"restart_{restart}",
+                pred_idx=best_pred,
+                mi_stop=mi_stop,
+                **ctx.quality_fields(best_quality),
+            )
+        else:
+            ctx.phase(f"restart_{restart}_no_improve", mi_stop=mi_stop, **ctx.quality_fields(best_quality))
+        if ctx.should_stop(best_quality):
+            stop_reason = _stop_reason(ctx, best_quality)
+            ctx.event("early_stop", reason=stop_reason, stage=f"restart_{restart}", **ctx.quality_fields(best_quality))
             break
+
+    if stop_reason == "complete" and ctx.exceeded():
+        stop_reason = "time_budget"
 
     return _finalize(
         clean=clean,
@@ -557,6 +809,8 @@ def run_sma_mi_fgsm(
         target_index=target_index,
         min_delta=min_delta,
         device=device,
+        ctx=ctx,
+        stop_reason=stop_reason,
     )
 
 
@@ -565,6 +819,7 @@ def runtime_profile_summary() -> str:
     budget = "unlimited" if _ATTACK_BUDGET_MS is None else f"{_ATTACK_BUDGET_MS}ms"
     return (
         f"gpu_profile={gpu} budget={budget} early_stop={_EARLY_STOP_OPTIMAL} "
+        f"attack_log={_attack_log_mode()} "
         f"steps={_DEFAULT_STEPS} restarts={_DEFAULT_RESTARTS} "
         f"sparse_topk={_SPARSE_TOPK} saliency_frac={_SALIENCY_FRACTION} "
         f"shrink_iters={_SHRINK_ITERATIONS} prune_chunks={_PRUNE_CHUNKS} quantize={_QUANTIZE_FINAL}"
