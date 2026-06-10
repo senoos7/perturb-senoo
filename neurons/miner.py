@@ -7,7 +7,7 @@ import typing
 import bittensor as bt
 import torch
 
-from perturbnet.sma_mi_fgsm import ALGORITHM_NAME, run_sma_mi_fgsm
+from perturbnet.attacks import list_attack_algorithms, run_attack, runtime_profile_summary
 from perturbnet.image_io import decode_image_b64, encode_image_b64
 from perturbnet.model import load_efficientnet_v2_l, resolve_target_index
 from perturbnet.protocol import AttackChallenge
@@ -96,6 +96,7 @@ class PerturbMiner:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.model = load_efficientnet_v2_l(self.device)
+        logger.info(f"[MINER] Attack profile: {runtime_profile_summary()}")
 
         self.axon = _make_axon(wallet=self.wallet, config=self.config)
         self.axon.attach(
@@ -168,7 +169,7 @@ class PerturbMiner:
         epsilon = float(synapse.epsilon)
         min_delta = float(getattr(synapse, "min_delta", 0.002))
 
-        adv, best_delta, final_pred = run_sma_mi_fgsm(
+        result = run_attack(
             clean=clean,
             model=self.model,
             target_index=target_index,
@@ -176,11 +177,12 @@ class PerturbMiner:
             min_delta=min_delta,
             device=self.device,
         )
-        synapse.perturbed_image_b64 = encode_image_b64(adv)
+        synapse.perturbed_image_b64 = encode_image_b64(result.adv)
         logger.info(
-            f"Finished task={getattr(synapse, 'task_id', 'unknown')} algorithm={ALGORITHM_NAME} "
-            f"target_idx={target_index} final_pred={final_pred} "
-            f"best_delta={best_delta:.6f} min_delta={min_delta:.6f}"
+            f"Finished task={getattr(synapse, 'task_id', 'unknown')} "
+            f"algorithm={result.algorithm_name} key={result.algorithm_key} "
+            f"target_idx={target_index} final_pred={result.pred_index} "
+            f"best_delta={result.linf:.6f} best_rmse={result.rmse:.6f} min_delta={min_delta:.6f}"
         )
         return synapse
 

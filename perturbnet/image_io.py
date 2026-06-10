@@ -16,10 +16,17 @@ def decode_image_b64(image_b64: str) -> torch.Tensor:
 
 
 def encode_image_b64(image_chw: torch.Tensor) -> str:
-    clipped = image_chw.detach().cpu().clamp(0.0, 1.0)
-    arr = (clipped.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
+    clipped = quantize_chw_to_8bit(image_chw)
+    arr = (clipped.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
     image = Image.fromarray(arr, mode="RGB")
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def quantize_chw_to_8bit(image_chw: torch.Tensor) -> torch.Tensor:
+    """Snap tensor to 8-bit pixel grid (matches validator PNG round-trip)."""
+    clipped = image_chw.detach().cpu().clamp(0.0, 1.0)
+    arr = (clipped.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
+    return torch.from_numpy(arr.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
 

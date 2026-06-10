@@ -23,7 +23,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from perturbnet import constants as C
-from perturbnet.sma_mi_fgsm import ALGORITHM_NAME, run_sma_mi_fgsm
+from perturbnet.attacks import list_attack_algorithms, run_attack, runtime_profile_summary
 from perturbnet.image_io import decode_image_b64, encode_image_b64
 from perturbnet.model import (
     load_efficientnet_v2_l,
@@ -226,7 +226,17 @@ def main() -> int:
     parser.add_argument("--min-delta", type=float, default=C.MIN_LINF_DELTA, help="Minimum Linf")
     parser.add_argument("--llm-endpoint", default="http://127.0.0.1:8081", help="LLM endpoint base URL")
     parser.add_argument("--llm-model", default="qwen2.5:1.5b-instruct")
-    parser.add_argument("--skip-llm", action="store_true", help="Skip LLM challenge verification")
+    parser.add_argument(
+        "--algorithm",
+        default=os.getenv("PERTURB_ATTACK_ALGORITHM", "sma_mi_fgsm"),
+        choices=list_attack_algorithms(),
+        help="Attack algorithm (or set PERTURB_ATTACK_ALGORITHM)",
+    )
+    parser.add_argument(
+        "--skip-llm",
+        action="store_true",
+        help="Skip LLM semantic verify (attack + score only)",
+    )
     args = parser.parse_args()
 
     print("=== Perturb local end-to-end test ===")
@@ -262,19 +272,24 @@ def main() -> int:
         except requests.RequestException as exc:
             print(f"  LLM unavailable ({exc}); re-run with --skip-llm for attack-only test")
 
-    print(f"[4/5] Miner attack ({ALGORITHM_NAME})")
+    print(f"profile: {runtime_profile_summary()}")
+    print(f"[4/5] Miner attack ({args.algorithm})")
     t0 = time.perf_counter()
-    adv, linf, pred_idx = run_sma_mi_fgsm(
+    result = run_attack(
         clean=clean,
         model=model,
         target_index=target_index,
         epsilon=args.epsilon,
         min_delta=args.min_delta,
         device=device,
+        algorithm=args.algorithm,
     )
     attack_ms = int((time.perf_counter() - t0) * 1000)
-    adv_b64 = encode_image_b64(adv)
-    print(f"  attack_time_ms={attack_ms} linf={linf:.6f} pred_idx={pred_idx}")
+    adv_b64 = encode_image_b64(result.adv)
+    print(
+        f"  attack_time_ms={attack_ms} algorithm={result.algorithm_key} "
+        f"linf={result.linf:.6f} rmse={result.rmse:.6f} pred_idx={result.pred_index}"
+    )
 
     print("[5/5] Validator score (verify_and_score)")
     result = verify_and_score(
