@@ -30,4 +30,5 @@ export PM2_MINER_PROCESS="${PM2_MINER_PROCESS:-perturb-miner}"
 exec "$PYTHON_BIN" "$SCRIPT_DIR/miner_log_reporter.py" \
   --env-file "$ENV_FILE" \
   --pm2-process "$PM2_MINER_PROCESS" \
-  --heartbeat-seconds "${SLACK_HEARTBEAT_SECONDS:-1800}"
+  --heartbeat-seconds "${SLACK_HEARTBEAT_SECONDS:-1800}" \
+  --digest-seconds "${SLACK_DIGEST_SECONDS:-600}"
