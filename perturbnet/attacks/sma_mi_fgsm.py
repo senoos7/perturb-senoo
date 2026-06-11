@@ -101,7 +101,7 @@ _PRUNE_CHUNKS = _profile_int("PERTURB_PRUNE_CHUNKS", cpu_default=64, gpu_default
 _QUANTIZE_FINAL = _env_bool("PERTURB_QUANTIZE_FINAL", default=True)
 _EARLY_STOP_OPTIMAL = _env_bool("PERTURB_ATTACK_EARLY_STOP", default=True)
 _ATTACK_BUDGET_MS = _attack_budget_ms()
-_SPARSE_BUDGET_FRAC = _profile_float("PERTURB_SPARSE_BUDGET_FRAC", cpu_default=0.25, gpu_default=0.25)
+_SPARSE_BUDGET_FRAC = _profile_float("PERTURB_SPARSE_BUDGET_FRAC", cpu_default=0.08, gpu_default=0.08)
 _FULL_REFINE_MAX_PIXELS = _profile_int(
     "PERTURB_FULL_REFINE_MAX_PIXELS", cpu_default=2_000_000, gpu_default=2_000_000
 )
@@ -924,6 +924,17 @@ def run_sma_mi_fgsm(
         if ctx.exceeded():
             stop_reason = "time_budget"
             ctx.event("early_stop", reason=stop_reason, stage=f"restart_{restart}_mi_fgsm", mi_stop=mi_stop)
+            # Salvage whatever MI-FGSM produced before dropping out — avoids linf=0 returns.
+            best, best_quality, best_pred = _consider_candidate(
+                clean=clean_work,
+                candidate=raw,
+                model=model,
+                target_index=target_index,
+                min_delta=min_delta,
+                best=best,
+                best_quality=best_quality,
+                best_pred=best_pred,
+            )
             break
         candidate = _refine_candidate(
             clean=clean_work,
