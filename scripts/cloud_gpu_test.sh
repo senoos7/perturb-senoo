@@ -7,10 +7,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 SCRIPT_DIR="$ROOT_DIR/scripts"
 
-DEFAULT_ENV_FILE="$SCRIPT_DIR/gpu_test.env"
+DEFAULT_ENV_FILE="$SCRIPT_DIR/miner.test.env"
 FALLBACK_ENV_FILE="$SCRIPT_DIR/miner.env"
-EXAMPLE_ENV_FILE="$SCRIPT_DIR/gpu_test.env.example"
-APGD_CW_ENV_FILE="$SCRIPT_DIR/gpu_test_apgd_cw.env.example"
+EXAMPLE_ENV_FILE="$SCRIPT_DIR/miner.test.env.example"
 ENV_FILE="${PERTURB_ENV_FILE:-$DEFAULT_ENV_FILE}"
 
 while [[ $# -gt 0 ]]; do
@@ -40,7 +39,6 @@ if [[ -f "$ENV_FILE" ]]; then
 elif [[ -f "$EXAMPLE_ENV_FILE" ]]; then
   echo "No env file found. Create one from template:"
   echo "  cp \"$EXAMPLE_ENV_FILE\" \"$DEFAULT_ENV_FILE\""
-  echo "  # or APGD-CW: cp \"$APGD_CW_ENV_FILE\" \"$DEFAULT_ENV_FILE\""
   echo "Continuing with built-in defaults..."
 else
   echo "No env file found; continuing with built-in defaults..."

@@ -9,7 +9,7 @@ Select via environment variable:
 Add a new algorithm:
   1. Create perturbnet/attacks/<name>.py with run_<name>() and runtime_profile_summary()
   2. Register it in _REGISTRY below
-  3. Set PERTURB_ATTACK_ALGORITHM=<name> in miner.env
+  3. Set PERTURB_ATTACK_ALGORITHM=<name> in scripts/miner.env
 """
 from __future__ import annotations
 

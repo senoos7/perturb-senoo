@@ -201,7 +201,7 @@ This section is specifically for miner operators.
 Create miner env:
 
 ```bash
-cp scripts/miner.env.example scripts/miner.env
+cp scripts/miner.production.env.example scripts/miner.env
 ```
 
 Edit required fields in `scripts/miner.env`:
@@ -211,11 +211,22 @@ Edit required fields in `scripts/miner.env`:
 - `NETUID`
 - `NETWORK`
 
+Attack tuning is shared via `scripts/gpu_attack.env.example` (sourced automatically). Override any `PERTURB_*` var in `miner.env` after the source line if needed.
+
 Optional:
 
 - `PYTHON_BIN`
-- `LOG_LEVEL` (`DEBUG` default, set `INFO`/`WARNING`/`ERROR` if you want quieter logs)
+- `LOG_LEVEL` (`INFO` default in production template)
 - `MINER_EXTRA_ARGS`
+
+### GPU local test (no wallet)
+
+```bash
+cp scripts/miner.test.env.example scripts/miner.test.env
+bash ./scripts/cloud_gpu_test.sh
+```
+
+Switch algorithm in `miner.test.env`, e.g. `export PERTURB_ATTACK_ALGORITHM="apgd_cw"`.
 
 ### 2) Start miner
 

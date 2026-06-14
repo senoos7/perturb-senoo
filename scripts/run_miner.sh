@@ -5,15 +5,13 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 SCRIPT_DIR="$ROOT_DIR/scripts"
 ENV_FILE="$SCRIPT_DIR/miner.env"
-EXAMPLE_ENV_FILE="$SCRIPT_DIR/miner.env.example"
-GPU_EXAMPLE_ENV_FILE="$SCRIPT_DIR/miner.env.gpu.example"
+EXAMPLE_ENV_FILE="$SCRIPT_DIR/miner.production.env.example"
 
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "Missing $ENV_FILE"
   echo "Create it from template:"
-  echo "  cp \"$GPU_EXAMPLE_ENV_FILE\" \"$ENV_FILE\""
-  echo "  # or: cp \"$EXAMPLE_ENV_FILE\" \"$ENV_FILE\""
-  echo "Then edit WALLET_HOTKEY if your hotkey name is not 'default'."
+  echo "  cp \"$EXAMPLE_ENV_FILE\" \"$ENV_FILE\""
+  echo "Then edit WALLET_NAME / WALLET_HOTKEY / NETUID."
   exit 1
 fi
 

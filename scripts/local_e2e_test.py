@@ -245,7 +245,7 @@ def main() -> int:
     pre.add_argument(
         "--env-file",
         default=os.getenv("PERTURB_ENV_FILE", ""),
-        help="Load attack env vars before importing algorithms (e.g. scripts/gpu_test_apgd_cw.env.example)",
+        help="Load attack env vars before importing algorithms (e.g. scripts/miner.test.env.example)",
     )
     pre_args, _ = pre.parse_known_args()
     if pre_args.env_file:

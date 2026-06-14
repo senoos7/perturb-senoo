@@ -53,8 +53,8 @@ RE_FINISHED = re.compile(
     r"target_idx=(?P<target_idx>\d+) final_pred=(?P<final_pred>\d+) "
     r"best_delta=(?P<linf>[\d.]+) best_rmse=(?P<rmse>[\d.]+) min_delta=(?P<min_delta>[\d.]+)"
 )
-RE_DONE = re.compile(
-    r"\[SMA-MI-FGSM\] done .*"
+RE_ATTACK_DONE = re.compile(
+    r"\[(?:SMA-MI-FGSM|APGD-CW)\] done .*"
     r"elapsed_ms=(?P<elapsed_ms>\d+)(?: remaining_ms=(?P<remaining_ms>-?\d+))?"
     r".*stop=(?P<stop>\S+) linf=(?P<linf>[\d.]+) rmse=(?P<rmse>[\d.]+) "
     r"pred_idx=(?P<pred_idx>\d+) target_idx=(?P<target_idx>\d+) "
@@ -453,6 +453,18 @@ def _format_digest(state: ReporterState) -> str:
     )
 
 
+def _apply_attack_done(ctx: TaskContext, match: re.Match[str]) -> None:
+    ctx.stop = match.group("stop")
+    ctx.elapsed_ms = int(match.group("elapsed_ms"))
+    if match.group("remaining_ms"):
+        ctx.remaining_ms = int(match.group("remaining_ms"))
+    ctx.final_pred = int(match.group("pred_idx"))
+    ctx.target_idx = int(match.group("target_idx"))
+    ctx.misclassified_attack = match.group("misclassified") == "True"
+    ctx.done_linf = float(match.group("linf"))
+    ctx.done_rmse = float(match.group("rmse"))
+
+
 def _handle_sma_line(clean: str, ctx: TaskContext) -> None:
     fields = _parse_log_fields(clean)
 
@@ -604,25 +616,17 @@ def _handle_line(line: str, args: argparse.Namespace, state: ReporterState) -> N
             ctx.budget_ms = None if budget == "unlimited" else int(budget)
         return
 
+    match = RE_ATTACK_DONE.search(clean)
+    if match:
+        ctx = _latest_task(state)
+        if ctx is not None:
+            _apply_attack_done(ctx, match)
+        return
+
     if "[SMA-MI-FGSM]" in clean:
         ctx = _latest_task(state)
         if ctx is not None:
             _handle_sma_line(clean, ctx)
-        return
-
-    match = RE_DONE.search(clean)
-    if match:
-        ctx = _latest_task(state)
-        if ctx is not None:
-            ctx.stop = match.group("stop")
-            ctx.elapsed_ms = int(match.group("elapsed_ms"))
-            if match.group("remaining_ms"):
-                ctx.remaining_ms = int(match.group("remaining_ms"))
-            ctx.final_pred = int(match.group("pred_idx"))
-            ctx.target_idx = int(match.group("target_idx"))
-            ctx.misclassified_attack = match.group("misclassified") == "True"
-            ctx.done_linf = float(match.group("linf"))
-            ctx.done_rmse = float(match.group("rmse"))
         return
 
     match = RE_FINISHED.search(clean)
