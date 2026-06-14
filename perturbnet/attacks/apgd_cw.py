@@ -47,6 +47,7 @@ import torch
 import torch.nn.functional as F
 
 from perturbnet.attacks import sma_mi_fgsm as sma
+from perturbnet.attacks.losses import dlr_untargeted_objective
 from perturbnet.image_io import quantize_chw_to_8bit
 from perturbnet.model import logits_for_images, predict_index
 
@@ -301,21 +302,8 @@ class _WorkScale:
         ).clamp(0.0, 1.0)
 
 
-# --- DLR loss ---------------------------------------------------------------
-def _dlr_ascent_objective(logits: torch.Tensor, y: int) -> torch.Tensor:
-    """Difference-of-Logits-Ratio, maximised to push class y below its rivals.
-
-    DLR(x,y) = -(z_y - max_{i!=y} z_i) / (z_pi1 - z_pi3)
-    Higher value => more misclassified. Shift and scale invariant.
-    """
-    z = logits.squeeze(0)
-    z_sorted, _ = z.sort(descending=True)
-    z_y = z[y]
-    masked = z.clone()
-    masked[y] = float("-inf")
-    z_max_other = masked.max()
-    denom = (z_sorted[0] - z_sorted[2]).clamp_min(1e-12)
-    return -(z_y - z_max_other) / denom
+# --- DLR loss (shared with SMA-MI-FGSM) -------------------------------------
+_dlr_ascent_objective = dlr_untargeted_objective
 
 
 def _apgd_checkpoints(n_iter: int) -> set[int]:

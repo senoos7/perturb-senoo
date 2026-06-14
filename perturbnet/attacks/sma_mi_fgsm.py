@@ -22,6 +22,9 @@ A  — Attack pipeline with random restarts
 MI — Momentum Iterative Fast Gradient Sign Method
 FGSM — projected L∞ gradient-sign steps
 
+Untargeted loss defaults to DLR (Difference-of-Logits-Ratio); set
+PERTURB_ATTACK_LOSS=ce to use legacy cross-entropy ascent.
+
 Post-processing
 ---------------
 - Binary shrink: minimize L∞ while keeping misclassification
@@ -38,6 +41,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn.functional as F
 
+from perturbnet.attacks.losses import dlr_untargeted_objective
 from perturbnet.image_io import quantize_chw_to_8bit
 from perturbnet.model import logits_for_images, predict_index
 
@@ -115,6 +119,23 @@ def _attack_max_dim() -> int:
 
 
 _ATTACK_MAX_DIM = _attack_max_dim()
+
+
+def _attack_loss_mode() -> str:
+    raw = os.getenv("PERTURB_ATTACK_LOSS", "dlr").strip().lower()
+    if raw in {"ce", "cross_entropy", "cross-entropy"}:
+        return "ce"
+    return "dlr"
+
+
+def _untargeted_attack_loss(logits: torch.Tensor, target_index: int) -> torch.Tensor:
+    """Scalar for autograd.grad — ascent step uses sign(∇loss) on the image."""
+    device = logits.device
+    if _attack_loss_mode() == "ce":
+        target = torch.tensor([target_index], device=device)
+        return F.cross_entropy(logits, target)
+    # Minimize -DLR ≡ ascend DLR (same sign update as CE ascent in MI-FGSM).
+    return -dlr_untargeted_objective(logits, target_index)
 
 
 def _attack_log_mode() -> str:
@@ -387,7 +408,7 @@ def _snap_8bit(
 def _saliency_order(clean: torch.Tensor, model: torch.nn.Module, target_index: int) -> torch.Tensor:
     probe = clean.clone().detach().requires_grad_(True)
     logits = logits_for_images(model=model, image_bchw=probe.unsqueeze(0))
-    loss = F.cross_entropy(logits, torch.tensor([target_index], device=clean.device))
+    loss = _untargeted_attack_loss(logits, target_index)
     grad = torch.autograd.grad(loss, probe)[0]
     return grad.abs().flatten().argsort(descending=True)
 
@@ -481,10 +502,10 @@ def _mi_fgsm_untargeted(
         steps=steps,
         masked=masked,
         noise=noise_scale > 0.0,
+        loss=_attack_loss_mode(),
     )
 
     velocity = torch.zeros_like(clean)
-    target = torch.tensor([target_index], device=clean.device)
     stop_reason = "max_steps"
 
     for step_idx in range(steps):
@@ -494,7 +515,7 @@ def _mi_fgsm_untargeted(
         ctx.progress("mi_fgsm", step_idx + 1, steps, restart=restart_idx)
         adv.requires_grad_(True)
         logits = logits_for_images(model=model, image_bchw=adv.unsqueeze(0))
-        loss = F.cross_entropy(logits, target)
+        loss = _untargeted_attack_loss(logits, target_index)
         grad = torch.autograd.grad(loss, adv)[0]
         if saliency_mask is not None:
             grad = grad * saliency_mask
@@ -845,6 +866,7 @@ def run_sma_mi_fgsm(
         restarts=restarts,
         budget_ms=_ATTACK_BUDGET_MS if _ATTACK_BUDGET_MS is not None else "unlimited",
         sparse_budget_frac=_SPARSE_BUDGET_FRAC,
+        attack_loss=_attack_loss_mode(),
         log_mode=ctx.log_mode,
     )
 
@@ -993,7 +1015,7 @@ def runtime_profile_summary() -> str:
     max_dim = _ATTACK_MAX_DIM if _ATTACK_MAX_DIM > 0 else "full"
     return (
         f"gpu_profile={gpu} budget={budget} early_stop={_EARLY_STOP_OPTIMAL} "
-        f"attack_log={_attack_log_mode()} attack_max_dim={max_dim} "
+        f"attack_log={_attack_log_mode()} attack_max_dim={max_dim} attack_loss={_attack_loss_mode()} "
         f"sparse_budget_frac={_SPARSE_BUDGET_FRAC} "
         f"steps={_DEFAULT_STEPS} restarts={_DEFAULT_RESTARTS} "
         f"sparse_topk={_SPARSE_TOPK} saliency_frac={_SALIENCY_FRACTION} "
