@@ -22,8 +22,7 @@ A  — Attack pipeline with random restarts
 MI — Momentum Iterative Fast Gradient Sign Method
 FGSM — projected L∞ gradient-sign steps
 
-Untargeted loss defaults to DLR (Difference-of-Logits-Ratio); set
-PERTURB_ATTACK_LOSS=ce to use legacy cross-entropy ascent.
+Untargeted loss defaults to CE; set PERTURB_ATTACK_LOSS=dlr for DLR ascent.
 
 Post-processing
 ---------------
@@ -122,10 +121,10 @@ _ATTACK_MAX_DIM = _attack_max_dim()
 
 
 def _attack_loss_mode() -> str:
-    raw = os.getenv("PERTURB_ATTACK_LOSS", "dlr").strip().lower()
-    if raw in {"ce", "cross_entropy", "cross-entropy"}:
-        return "ce"
-    return "dlr"
+    raw = os.getenv("PERTURB_ATTACK_LOSS", "ce").strip().lower()
+    if raw in {"dlr", "difference_of_logits", "difference-of-logits"}:
+        return "dlr"
+    return "ce"
 
 
 def _untargeted_attack_loss(logits: torch.Tensor, target_index: int) -> torch.Tensor:
