@@ -354,7 +354,12 @@ Use `docs/READINESS_CHECKLIST.md` before long-run validation or deployment.
 - `neurons/validator.py`: validator loop, challenge build, verification, scoring, set_weights
 - `neurons/miner.py`: baseline miner logic and Axon serving
 - `perturbnet/protocol.py`: `AttackChallenge` synapse schema
-- `perturbnet/model.py`: EfficientNet model load and label prediction helpers
+- `perturbnet/model.py`: EfficientNet model load and label pre8. Notes / Recommendations
+  Residual U-Net keeps spatial information → helps satisfy SSIM / PSNR constraints
+  Feature conditioning improves attack success rate → consider concatenating logits, gradient maps, or embeddings
+  Flexible depth/width depending on GPU memory → e.g., smaller base channels for 350×350, larger for 6000×4000
+  Optional attention modules in bottleneck → focus perturbation on critical regions (like top-k saliency)
+  Inference speed → single forward pass produces perturbation for full image → fits subnet budgetdiction helpers
 - `perturbnet/image_io.py`: base64 image encode/decode helpers
 - `tools/llm_endpoint_service.py`: validator-side semantic verification service
 - `scripts/run_llm_endpoint.sh`: start/restart llm endpoint with PM2 (auto-ensures Ollama + model)

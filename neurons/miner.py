@@ -1,19 +1,79 @@
 import argparse
+import concurrent.futures
 import json
 import logging as pylogging
 import os
 import time
 import typing
+from pathlib import Path
 
 import bittensor as bt
 import torch
 
 from perturbnet.attacks import list_attack_algorithms, run_attack, runtime_profile_summary
-from perturbnet.image_io import decode_image_b64, encode_image_b64
+from perturbnet.constants import (
+    CHALLENGE_SAVE_DIR,
+    MINER_VALIDATOR_IP_WHITELIST,
+    R2_UPLOAD_CHALLENGES,
+    SAVE_CHALLENGE_IMAGES,
+)
+from perturbnet.image_io import (
+    challenge_image_b64_to_jpeg_bytes,
+    decode_image_b64,
+    encode_image_b64,
+    sanitize_task_id_for_filename,
+)
 from perturbnet.model import load_efficientnet_v2_l, resolve_target_index
 from perturbnet.protocol import AttackChallenge
+from perturbnet.r2_storage import ChallengeR2Uploader
 
 logger = pylogging.getLogger(__name__)
+
+# Disable with MINER_VALIDATOR_IP_WHITELIST=off
+_IP_WHITELIST_DISABLED = frozenset({"off", "false", "0", "no", "*", "all"})
+
+
+def _parse_validator_ip_whitelist(raw: str) -> list[tuple[str, int | None]]:
+    """Parse comma-separated entries: ``ip`` or ``ip:axon_port``."""
+    entries: list[tuple[str, int | None]] = []
+    for part in raw.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if ":" in item:
+            ip, port_raw = item.rsplit(":", 1)
+            entries.append((ip.strip(), int(port_raw.strip())))
+        else:
+            entries.append((item, None))
+    return entries
+
+
+def _caller_ip_whitelisted(
+    *,
+    caller_ip: str | None,
+    caller_uid: int | None,
+    metagraph: typing.Any,
+    whitelist: list[tuple[str, int | None]],
+) -> tuple[bool, str]:
+    if not caller_ip:
+        return False, "Missing caller IP"
+    for allowed_ip, allowed_axon_port in whitelist:
+        if caller_ip != allowed_ip:
+            continue
+        if allowed_axon_port is None:
+            return True, "OK"
+        if caller_uid is None:
+            return False, f"Caller IP {caller_ip} requires registered axon port {allowed_axon_port}"
+        axon = metagraph.axons[caller_uid]
+        axon_ip = str(getattr(axon, "ip", "") or "").strip()
+        axon_port = int(getattr(axon, "port", 0) or 0)
+        if axon_ip == allowed_ip and axon_port == allowed_axon_port:
+            return True, "OK"
+        return (
+            False,
+            f"Caller axon {axon_ip}:{axon_port} does not match whitelist {allowed_ip}:{allowed_axon_port}",
+        )
+    return False, f"Caller IP {caller_ip} not in whitelist"
 
 
 def _make_wallet(config):
@@ -127,6 +187,49 @@ class PerturbMiner:
         self.model = load_efficientnet_v2_l(self.device)
         logger.info(f"[MINER] Attack profile: {runtime_profile_summary()}")
 
+        whitelist_raw = MINER_VALIDATOR_IP_WHITELIST
+        if whitelist_raw.lower() in _IP_WHITELIST_DISABLED:
+            self._validator_ip_whitelist: list[tuple[str, int | None]] = []
+            logger.warning("[MINER] Validator IP whitelist disabled")
+        else:
+            self._validator_ip_whitelist = _parse_validator_ip_whitelist(whitelist_raw)
+            if not self._validator_ip_whitelist:
+                raise RuntimeError(
+                    "MINER_VALIDATOR_IP_WHITELIST is empty; set entries like 63.142.193.28:31711 or 'off' to disable"
+                )
+            logger.info(f"[MINER] Validator IP whitelist: {whitelist_raw}")
+
+        self._save_challenge_images = SAVE_CHALLENGE_IMAGES
+        self._challenge_save_dir = Path(CHALLENGE_SAVE_DIR or "data/challenges")
+        if not self._challenge_save_dir.is_absolute():
+            self._challenge_save_dir = Path(__file__).resolve().parents[1] / self._challenge_save_dir
+        if self._save_challenge_images:
+            self._challenge_save_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"[MINER] Saving challenge images to {self._challenge_save_dir}")
+
+        self._challenge_r2: ChallengeR2Uploader | None = None
+        self._challenge_persist_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        if R2_UPLOAD_CHALLENGES:
+            try:
+                self._challenge_r2 = ChallengeR2Uploader.from_env()
+            except Exception as exc:
+                raise RuntimeError(f"Failed to configure R2 challenge upload: {exc}") from exc
+            logger.info(
+                f"[MINER] R2 challenge upload enabled bucket={self._challenge_r2.bucket} "
+                f"prefix={self._challenge_r2.prefix}"
+            )
+
+        if self._save_challenge_images or self._challenge_r2 is not None:
+            worker_count = max(1, int(os.getenv("PERTURB_CHALLENGE_PERSIST_WORKERS", "2")))
+            self._challenge_persist_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="challenge-persist",
+            )
+            logger.info(
+                "[MINER] Challenge image persist runs in background after attack "
+                f"(workers={worker_count})"
+            )
+
         self.axon = _make_axon(wallet=self.wallet, config=self.config)
         self.axon.attach(
             forward_fn=self.forward,
@@ -174,6 +277,74 @@ class PerturbMiner:
     def sync(self) -> None:
         self.metagraph.sync(subtensor=self.subtensor)
 
+    def _persist_clean_challenge_image(
+        self,
+        task_id: str,
+        clean_b64: str,
+        prompt: str,
+        true_label: str,
+    ) -> None:
+        if not clean_b64.strip():
+            logger.warning(f"[CHALLENGE_SAVE] task_id={task_id} skipped: missing clean_image_b64")
+            return
+
+        safe_id = sanitize_task_id_for_filename(task_id)
+        filename = f"{safe_id}_clean.jpg"
+
+        try:
+            jpeg_bytes = challenge_image_b64_to_jpeg_bytes(clean_b64)
+        except Exception as exc:
+            logger.warning(f"[CHALLENGE_SAVE] task_id={task_id} decode failed: {exc}")
+            return
+
+        if self._save_challenge_images:
+            output_path = self._challenge_save_dir / filename
+            try:
+                output_path.write_bytes(jpeg_bytes)
+            except Exception as exc:
+                logger.warning(f"[CHALLENGE_SAVE] task_id={task_id} local write failed: {exc}")
+            else:
+                logger.info(f"[CHALLENGE_SAVED] task_id={task_id} path={output_path}")
+
+        if self._challenge_r2 is not None:
+            try:
+                object_key = self._challenge_r2.upload_jpeg(
+                    filename,
+                    jpeg_bytes,
+                    metadata={
+                        "task_id": task_id,
+                        "prompt": prompt,
+                        "true_label": true_label,
+                    },
+                )
+            except Exception as exc:
+                logger.warning(f"[CHALLENGE_R2] task_id={task_id} upload failed: {exc}")
+            else:
+                logger.info(
+                    f"[CHALLENGE_R2] task_id={task_id} bucket={self._challenge_r2.bucket} key={object_key}"
+                )
+
+    def _schedule_challenge_persist_background(
+        self,
+        synapse: AttackChallenge,
+        task_id: str,
+    ) -> None:
+        if self._challenge_persist_executor is None:
+            return
+        clean_b64 = getattr(synapse, "clean_image_b64", None)
+        if not isinstance(clean_b64, str) or not clean_b64.strip():
+            return
+        prompt = getattr(synapse, "prompt", "") or ""
+        true_label = getattr(synapse, "true_label", "") or ""
+        self._challenge_persist_executor.submit(
+            self._persist_clean_challenge_image,
+            task_id,
+            clean_b64,
+            prompt,
+            true_label,
+        )
+        logger.info(f"[CHALLENGE_PERSIST] task_id={task_id} queued background")
+
     async def forward(self, synapse: AttackChallenge) -> AttackChallenge:
         task_id = getattr(synapse, "task_id", "unknown")
         self._log_step_start(
@@ -193,51 +364,71 @@ class PerturbMiner:
                 ensure_ascii=False,
             ),
         )
-        if synapse.norm_type != "Linf":
-            logger.info(f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unsupported norm_type={synapse.norm_type}")
-            synapse.perturbed_image_b64 = synapse.clean_image_b64
-            return synapse
+        try:
+            if synapse.norm_type != "Linf":
+                logger.info(f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unsupported norm_type={synapse.norm_type}")
+                synapse.perturbed_image_b64 = synapse.clean_image_b64
+                return synapse
 
-        clean = decode_image_b64(synapse.clean_image_b64).to(self.device)
-        target_index = resolve_target_index(synapse.true_label)
-        if target_index is None:
-            logger.warning(
-                f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unresolved true_label={getattr(synapse, 'true_label', None)}"
+            clean = decode_image_b64(synapse.clean_image_b64).to(self.device)
+            target_index = resolve_target_index(synapse.true_label)
+            if target_index is None:
+                logger.warning(
+                    f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unresolved true_label={getattr(synapse, 'true_label', None)}"
+                )
+                synapse.perturbed_image_b64 = synapse.clean_image_b64
+                return synapse
+
+            epsilon = float(synapse.epsilon)
+            min_delta = float(getattr(synapse, "min_delta", 0.002))
+
+            result = run_attack(
+                clean=clean,
+                model=self.model,
+                target_index=target_index,
+                epsilon=epsilon,
+                min_delta=min_delta,
+                device=self.device,
             )
-            synapse.perturbed_image_b64 = synapse.clean_image_b64
+            synapse.perturbed_image_b64 = encode_image_b64(result.adv)
+            logger.info(
+                f"Finished task={getattr(synapse, 'task_id', 'unknown')} "
+                f"algorithm={result.algorithm_name} key={result.algorithm_key} "
+                f"target_idx={target_index} final_pred={result.pred_index} "
+                f"best_delta={result.linf:.6f} best_rmse={result.rmse:.6f} min_delta={min_delta:.6f}"
+            )
             return synapse
-
-        epsilon = float(synapse.epsilon)
-        min_delta = float(getattr(synapse, "min_delta", 0.002))
-
-        result = run_attack(
-            clean=clean,
-            model=self.model,
-            target_index=target_index,
-            epsilon=epsilon,
-            min_delta=min_delta,
-            device=self.device,
-        )
-        synapse.perturbed_image_b64 = encode_image_b64(result.adv)
-        logger.info(
-            f"Finished task={getattr(synapse, 'task_id', 'unknown')} "
-            f"algorithm={result.algorithm_name} key={result.algorithm_key} "
-            f"target_idx={target_index} final_pred={result.pred_index} "
-            f"best_delta={result.linf:.6f} best_rmse={result.rmse:.6f} min_delta={min_delta:.6f}"
-        )
-        return synapse
+        finally:
+            self._schedule_challenge_persist_background(synapse, task_id)
 
     async def blacklist(self, synapse: AttackChallenge) -> typing.Tuple[bool, str]:
+        caller_ip = getattr(getattr(synapse, "dendrite", None), "ip", None)
         self._log_step_start(
             "miner_blacklist",
             task_id=getattr(synapse, "task_id", "unknown"),
             caller_hotkey=getattr(getattr(synapse, "dendrite", None), "hotkey", None),
+            caller_ip=caller_ip,
         )
         if synapse.dendrite is None or synapse.dendrite.hotkey is None:
             logger.warning("Blacklist reject: missing caller hotkey")
             return True, "Missing caller hotkey"
 
         hotkey = synapse.dendrite.hotkey
+        caller_uid: int | None = None
+        if hotkey in self.metagraph.hotkeys:
+            caller_uid = self.metagraph.hotkeys.index(hotkey)
+
+        if self._validator_ip_whitelist:
+            allowed, reason = _caller_ip_whitelisted(
+                caller_ip=str(caller_ip) if caller_ip else None,
+                caller_uid=caller_uid,
+                metagraph=self.metagraph,
+                whitelist=self._validator_ip_whitelist,
+            )
+            if not allowed:
+                logger.warning(f"Blacklist reject: {reason}")
+                return True, reason
+
         if hotkey not in self.metagraph.hotkeys:
             logger.warning(f"Blacklist reject: unregistered caller hotkey={hotkey}")
             return True, "Unregistered caller"
@@ -247,7 +438,7 @@ class PerturbMiner:
             logger.warning(f"Blacklist reject: caller uid={uid} lacks validator permit")
             return True, "Caller is not validator"
 
-        logger.info(f"Blacklist allow: caller uid={uid} hotkey={hotkey}")
+        logger.info(f"Blacklist allow: caller uid={uid} hotkey={hotkey} ip={caller_ip}")
         return False, "OK"
 
     async def priority(self, synapse: AttackChallenge) -> float:

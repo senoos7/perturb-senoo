@@ -4,6 +4,8 @@ __pycache__/
 .DS_Store
 *.npz
 logs/
+data/pexels/
+data/challenges/
 scripts/miner.env
 scripts/miner.test.env
 scripts/validator.env
@@ -11,4 +13,5 @@ scripts/verifier.env
 scripts/label_matcher.env
 scripts/llm_endpoint.env
 scripts/miner_slack.env
+scripts/miner_r2.env
 

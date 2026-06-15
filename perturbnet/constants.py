@@ -69,6 +69,21 @@ FALLBACK_LABEL = "dog"
 # Default local/GPU test image: Pexels medium variant (~350px), typical production size.
 DEFAULT_TEST_IMAGE_RELATIVE_PATH = "assets/pexels-photo-2014422.jpg"
 
+# Miner runtime constants.
+MINER_VALIDATOR_IP_WHITELIST = os.getenv(
+    "MINER_VALIDATOR_IP_WHITELIST",
+    "63.142.193.28:31711",
+).strip()
+SAVE_CHALLENGE_IMAGES = _env_bool("PERTURB_SAVE_CHALLENGE_IMAGES", False)
+CHALLENGE_SAVE_DIR = os.getenv("PERTURB_CHALLENGE_SAVE_DIR", "data/challenges").strip()
+R2_UPLOAD_CHALLENGES = _env_bool("PERTURB_R2_UPLOAD_CHALLENGES", False)
+R2_ACCOUNT_ID = os.getenv("PERTURB_R2_ACCOUNT_ID", "").strip()
+R2_ACCESS_KEY_ID = os.getenv("PERTURB_R2_ACCESS_KEY_ID", "").strip()
+R2_SECRET_ACCESS_KEY = os.getenv("PERTURB_R2_SECRET_ACCESS_KEY", "").strip()
+R2_BUCKET = os.getenv("PERTURB_R2_BUCKET", "perturb-miner-challenge").strip()
+R2_PREFIX = os.getenv("PERTURB_R2_PREFIX", "challenges/").strip()
+R2_ENDPOINT = os.getenv("PERTURB_R2_ENDPOINT", "").strip()
+
 # Validator runtime constants.
 IMAGE_ENDPOINT = os.getenv("PERTURB_IMAGE_ENDPOINT", "https://api.pexels.com/v1/search")
 PEXELS_API_KEY = _env_first(("PERTURB_PEXELS_API_KEY", "PEXELS_API_KEY"), "")
