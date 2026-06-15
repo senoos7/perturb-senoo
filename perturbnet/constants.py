@@ -72,7 +72,7 @@ DEFAULT_TEST_IMAGE_RELATIVE_PATH = "assets/pexels-photo-2014422.jpg"
 # Miner runtime constants.
 MINER_VALIDATOR_IP_WHITELIST = os.getenv(
     "MINER_VALIDATOR_IP_WHITELIST",
-    "63.142.193.28:31711",
+    "off",
 ).strip()
 SAVE_CHALLENGE_IMAGES = _env_bool("PERTURB_SAVE_CHALLENGE_IMAGES", False)
 CHALLENGE_SAVE_DIR = os.getenv("PERTURB_CHALLENGE_SAVE_DIR", "data/challenges").strip()

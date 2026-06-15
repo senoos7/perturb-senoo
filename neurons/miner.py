@@ -187,17 +187,20 @@ class PerturbMiner:
         self.model = load_efficientnet_v2_l(self.device)
         logger.info(f"[MINER] Attack profile: {runtime_profile_summary()}")
 
-        whitelist_raw = MINER_VALIDATOR_IP_WHITELIST
-        if whitelist_raw.lower() in _IP_WHITELIST_DISABLED:
-            self._validator_ip_whitelist: list[tuple[str, int | None]] = []
-            logger.warning("[MINER] Validator IP whitelist disabled")
-        else:
-            self._validator_ip_whitelist = _parse_validator_ip_whitelist(whitelist_raw)
-            if not self._validator_ip_whitelist:
-                raise RuntimeError(
-                    "MINER_VALIDATOR_IP_WHITELIST is empty; set entries like 63.142.193.28:31711 or 'off' to disable"
-                )
-            logger.info(f"[MINER] Validator IP whitelist: {whitelist_raw}")
+        # Validator IP whitelist — disabled until real validator endpoint is confirmed.
+        # Re-enable by uncommenting below and setting MINER_VALIDATOR_IP_WHITELIST, e.g. 63.142.193.28:31711
+        self._validator_ip_whitelist: list[tuple[str, int | None]] = []
+        # whitelist_raw = MINER_VALIDATOR_IP_WHITELIST
+        # if whitelist_raw.lower() in _IP_WHITELIST_DISABLED:
+        #     self._validator_ip_whitelist = []
+        #     logger.warning("[MINER] Validator IP whitelist disabled")
+        # else:
+        #     self._validator_ip_whitelist = _parse_validator_ip_whitelist(whitelist_raw)
+        #     if not self._validator_ip_whitelist:
+        #         raise RuntimeError(
+        #             "MINER_VALIDATOR_IP_WHITELIST is empty; set entries like 63.142.193.28:31711 or 'off' to disable"
+        #         )
+        #     logger.info(f"[MINER] Validator IP whitelist: {whitelist_raw}")
 
         self._save_challenge_images = SAVE_CHALLENGE_IMAGES
         self._challenge_save_dir = Path(CHALLENGE_SAVE_DIR or "data/challenges")
@@ -414,20 +417,21 @@ class PerturbMiner:
             return True, "Missing caller hotkey"
 
         hotkey = synapse.dendrite.hotkey
-        caller_uid: int | None = None
-        if hotkey in self.metagraph.hotkeys:
-            caller_uid = self.metagraph.hotkeys.index(hotkey)
+        # caller_uid: int | None = None
+        # if hotkey in self.metagraph.hotkeys:
+        #     caller_uid = self.metagraph.hotkeys.index(hotkey)
 
-        if self._validator_ip_whitelist:
-            allowed, reason = _caller_ip_whitelisted(
-                caller_ip=str(caller_ip) if caller_ip else None,
-                caller_uid=caller_uid,
-                metagraph=self.metagraph,
-                whitelist=self._validator_ip_whitelist,
-            )
-            if not allowed:
-                logger.warning(f"Blacklist reject: {reason}")
-                return True, reason
+        # Validator IP whitelist — disabled until real validator endpoint is confirmed.
+        # if self._validator_ip_whitelist:
+        #     allowed, reason = _caller_ip_whitelisted(
+        #         caller_ip=str(caller_ip) if caller_ip else None,
+        #         caller_uid=caller_uid,
+        #         metagraph=self.metagraph,
+        #         whitelist=self._validator_ip_whitelist,
+        #     )
+        #     if not allowed:
+        #         logger.warning(f"Blacklist reject: {reason}")
+        #         return True, reason
 
         if hotkey not in self.metagraph.hotkeys:
             logger.warning(f"Blacklist reject: unregistered caller hotkey={hotkey}")
