@@ -135,33 +135,14 @@ def _resolve_axon_port(config: typing.Any) -> int:
     return 9000
 
 
-def _make_axon(wallet, config):
-    resolved_config = config() if callable(config) else config
-    port = _resolve_axon_port(resolved_config)
-    if hasattr(resolved_config, "axon"):
-        resolved_config.axon.port = port
+def _make_axon(wallet, port: int):
+    resolved_port = int(port)
     if hasattr(bt, "axon"):
-        try:
-            return bt.axon(wallet=wallet, port=port, config=resolved_config)
-        except TypeError:
-            try:
-                return bt.axon(wallet=wallet, config=resolved_config)
-            except Exception:
-                return bt.axon(wallet=wallet, port=port)
-        except Exception:
-            return bt.axon(wallet=wallet, port=port)
+        return bt.axon(wallet=wallet, port=resolved_port)
     axon_cls = getattr(bt, "Axon", None)
     if axon_cls is None:
         raise RuntimeError("No axon constructor found in bittensor.")
-    try:
-        return axon_cls(wallet=wallet, port=port, config=resolved_config)
-    except TypeError:
-        try:
-            return axon_cls(wallet=wallet, config=resolved_config)
-        except Exception:
-            return axon_cls(wallet=wallet, port=port)
-    except Exception:
-        return axon_cls(wallet=wallet, port=port)
+    return axon_cls(wallet=wallet, port=resolved_port)
 
 
 def _configure_log_level(level_raw: str) -> None:
@@ -233,7 +214,8 @@ class PerturbMiner:
                 f"(workers={worker_count})"
             )
 
-        self.axon = _make_axon(wallet=self.wallet, config=self.config)
+        axon_port = int(getattr(getattr(self.config, "axon", object()), "port", 9000))
+        self.axon = _make_axon(wallet=self.wallet, port=axon_port)
         self.axon.attach(
             forward_fn=self.forward,
             blacklist_fn=self.blacklist,
