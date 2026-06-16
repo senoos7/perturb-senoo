@@ -6,6 +6,7 @@ __pycache__/
 *.npz
 logs/
 data/pexels/
+data/imagenet100/
 data/challenges/
 scripts/miner.env
 scripts/miner.test.env

@@ -37,6 +37,13 @@ def predict_index(model: torch.nn.Module, image_chw: torch.Tensor) -> int:
         return int(logits.argmax(dim=1).item())
 
 
+def predict_indices_batch(model: torch.nn.Module, images_bchw: torch.Tensor) -> list[int]:
+    """Batch argmax indices for BCHW images in [0, 1] float."""
+    with torch.no_grad():
+        logits = model(_preprocess_for_efficientnet_v2_l(images_bchw))
+        return [int(x) for x in logits.argmax(dim=1).tolist()]
+
+
 def logits_for_images(model: torch.nn.Module, image_bchw: torch.Tensor) -> torch.Tensor:
     return model(_preprocess_for_efficientnet_v2_l(image_bchw))
 
