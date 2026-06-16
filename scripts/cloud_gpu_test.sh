@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Run on cloud GPU server after upload. Prints metrics to share back.
-# Default test image: assets/pexels-photo-2014422.jpg (Pexels medium, 350x350).
+# Run on cloud GPU server after upload. ImageNet-100 local cache + validator scoring.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,18 +11,20 @@ FALLBACK_ENV_FILE="$SCRIPT_DIR/miner.env"
 EXAMPLE_ENV_FILE="$SCRIPT_DIR/miner.test.env.example"
 ENV_FILE="${PERTURB_ENV_FILE:-$DEFAULT_ENV_FILE}"
 
+EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --env-file)
       if [[ $# -lt 2 ]]; then
-        echo "Usage: bash ./scripts/cloud_gpu_test.sh [--env-file PATH] [local_e2e_test.py args...]"
+        echo "Usage: bash ./scripts/cloud_gpu_test.sh [--env-file PATH] [imagenet100_local_test.py args...]"
         exit 1
       fi
       ENV_FILE="$2"
       shift 2
       ;;
     *)
-      break
+      EXTRA_ARGS+=("$1")
+      shift
       ;;
   esac
 done
@@ -68,7 +69,14 @@ echo ""
 echo "=== attack profile ==="
 echo "algorithm=${PERTURB_ATTACK_ALGORITHM}"
 echo "gpu_profile=${PERTURB_GPU_PROFILE}"
-python scripts/local_e2e_test.py --skip-llm --algorithm "${PERTURB_ATTACK_ALGORITHM}" "$@"
+
+# Default: 3 ImageNet-100 rows, cuda when available (override with --max-rows etc.)
+DEFAULT_ARGS=(--max-rows 3 --device cuda --algorithm "${PERTURB_ATTACK_ALGORITHM}")
+if [[ ${#EXTRA_ARGS[@]} -eq 0 ]]; then
+  bash "$SCRIPT_DIR/run_imagenet100_local_test.sh" --env-file "$ENV_FILE" "${DEFAULT_ARGS[@]}"
+else
+  bash "$SCRIPT_DIR/run_imagenet100_local_test.sh" --env-file "$ENV_FILE" "${EXTRA_ARGS[@]}"
+fi
 
 echo ""
-echo "Copy the score/norm/rmse/attack_time_ms lines above and share them back."
+echo "Copy the score/norm/rmse/attack_ms lines above and share them back."

@@ -194,12 +194,16 @@ Optional:
 
 ### GPU local test (no wallet)
 
+Uses ImageNet-100 from the local Hugging Face cache (same challenge source as validators):
+
 ```bash
 cp scripts/miner.test.env.example scripts/miner.test.env
 bash ./scripts/cloud_gpu_test.sh
 ```
 
-Switch algorithm in `miner.test.env`, e.g. `export PERTURB_ATTACK_ALGORITHM="apgd_cw"`.
+Switch algorithm in `miner.test.env`, e.g. `export PERTURB_ATTACK_ALGORITHM="magi"`.
+
+More rows or CPU: `bash ./scripts/run_imagenet100_local_test.sh --max-rows 10 --algorithm magi`
 
 ### 2) Start miner
 

@@ -42,6 +42,8 @@ def _normalize_algorithm_key(raw: str) -> str:
         "apgd": "apgd_cw",
         "cw": "apgd_cw",
         "apgd_dlr_cw": "apgd_cw",
+        "momentum_ig": "magi",
+        "ig": "magi",
     }
     return aliases.get(key, key)
 

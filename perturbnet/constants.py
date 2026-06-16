@@ -44,10 +44,6 @@ MODEL_NAME = "EfficientNetV2-L"
 # Validator runtime state files.
 VALIDATOR_STATE_FILENAME = "perturb_validator_state.json"
 
-# Local miner/testing defaults (validator uses ImageNet-100, not fallback images).
-FALLBACK_LABEL = "dog"
-DEFAULT_TEST_IMAGE_RELATIVE_PATH = "assets/pexels-photo-2014422.jpg"
-
 # Miner runtime constants.
 MINER_VALIDATOR_IP_WHITELIST = os.getenv(
     "MINER_VALIDATOR_IP_WHITELIST",
