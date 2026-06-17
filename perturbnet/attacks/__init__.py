@@ -2,9 +2,10 @@
 Attack algorithm registry and dispatcher.
 
 Select via environment variable:
-  PERTURB_ATTACK_ALGORITHM=sma_mi_fgsm   (default)
+  PERTURB_ATTACK_ALGORITHM=ops_budget   (OPS minimum-norm, <16s on A100)
+  PERTURB_ATTACK_ALGORITHM=sma_mi_fgsm   (legacy default)
   PERTURB_ATTACK_ALGORITHM=apgd_cw      (APGD-DLR + C&W shrink)
-  PERTURB_ATTACK_ALGORITHM=magi          (stub, not yet implemented)
+  PERTURB_ATTACK_ALGORITHM=magi          (momentum IG attack)
 
 Add a new algorithm:
   1. Create perturbnet/attacks/<name>.py with run_<name>() and runtime_profile_summary()
@@ -21,9 +22,10 @@ import torch
 from perturbnet.attacks.base import AttackResult, AttackRunner, ProfileSummaryFn
 from perturbnet.attacks import apgd_cw as apgd_cw_module
 from perturbnet.attacks import magi as magi_module
+from perturbnet.attacks import ops_budget as ops_budget_module
 from perturbnet.attacks import sma_mi_fgsm as sma_mi_fgsm_module
 
-DEFAULT_ATTACK_ALGORITHM = "sma_mi_fgsm"
+DEFAULT_ATTACK_ALGORITHM = "ops_budget"
 
 
 class _RegisteredAttack(NamedTuple):
@@ -44,6 +46,9 @@ def _normalize_algorithm_key(raw: str) -> str:
         "apgd_dlr_cw": "apgd_cw",
         "momentum_ig": "magi",
         "ig": "magi",
+        "ops": "ops_budget",
+        "ops_budget": "ops_budget",
+        "ops_attack": "ops_budget",
     }
     return aliases.get(key, key)
 
@@ -66,6 +71,12 @@ _REGISTRY: dict[str, _RegisteredAttack] = {
         title=magi_module.ALGORITHM_NAME,
         runner=magi_module.run_magi,
         profile_summary=magi_module.runtime_profile_summary,
+    ),
+    "ops_budget": _RegisteredAttack(
+        key="ops_budget",
+        title=ops_budget_module.ALGORITHM_NAME,
+        runner=ops_budget_module.run_ops_budget,
+        profile_summary=ops_budget_module.runtime_profile_summary,
     ),
 }
 

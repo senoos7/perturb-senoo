@@ -4,10 +4,19 @@ __pycache__/
 .venv/
 .DS_Store
 *.npz
+
+# Local-only prepared datasets and caches (regenerate via scripts/prepare_dataset.py)
+data/
 logs/
+
+# Secrets
+.env
+
+# Legacy / other data paths
 data/pexels/
 data/imagenet100/
 data/challenges/
+
 scripts/miner.env
 scripts/miner.test.env
 scripts/validator.env
@@ -16,4 +25,3 @@ scripts/label_matcher.env
 scripts/llm_endpoint.env
 scripts/miner_slack.env
 scripts/miner_r2.env
-
