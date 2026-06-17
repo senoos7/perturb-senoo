@@ -6,11 +6,13 @@ setup(
     version="0.1.0",
     description="Perturb Bittensor subnet (adversarial image attacks)",
     packages=find_packages(),
+    py_modules=["ops_attack", "model_utils"],
     include_package_data=True,
     install_requires=[
         "bittensor>=8.0.0",
         "torch>=2.2.0",
         "torchvision>=0.17.0",
+        "timm>=0.9.0",
         "numpy>=1.26.0",
         "pillow>=10.0.0",
         "requests>=2.31.0",
