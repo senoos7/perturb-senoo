@@ -260,16 +260,12 @@ class BudgetConfig:
     sparse_restarts: int = 1    # restarts of the support-restricted PGD
     polish_rounds: int = 1      # backward-elimination passes after the k search
     restart_batch_size: int = 12  # restarts run in parallel on GPU (match first_level_restarts=12)
-    # ── Greedy forward selection ──────────────────────────────────────────────
-    # Instead of starting sparse binary search from a dense (100%-pixels) PGD
-    # warm point, first build the support from scratch via greedy forward:
-    #   each round adds `greedy_batch` pixels with highest |grad|, then runs a
-    #   short sign-reoptimisation PGD on the growing support.  Stops at the
-    #   first flip, giving the binary search a sparse warm start (typically
-    #   ~1-5% of pixels instead of 100%) and cutting search depth by ~log2(N/k).
-    use_greedy: bool = True      # enable greedy warm start for sparse phase
-    greedy_batch: int = 256      # elements added per greedy round
-    greedy_pgd_steps: int = 2    # sign re-opt PGD steps after each greedy round
+    # ── Gradient-probe binary search initialisation ───────────────────────────
+    # After PGD, count the elements in the top `probe_frac` fraction by gradient
+    # magnitude and try that many as the first sparse_pgd call.  If it flips, use
+    # it as the tighter upper bound for the binary search (saving ~5 levels ≈ 2s).
+    # If it fails, fall back to the full n_active upper bound as before.
+    probe_frac: float = 0.05     # top fraction of elements to probe (5% of C*H*W)
 
 
 def _make_budget_forward(cfg: BudgetConfig):
@@ -659,24 +655,34 @@ def _make_budget_forward(cfg: BudgetConfig):
             which support-restricted PGD still passes every gate + flip_margin,
             then greedily polish away any remaining redundant pixels.
 
-            When ``cfg.use_greedy`` is True, first runs ``_greedy_forward`` to
-            obtain a sparse warm start.  The binary search then spans [1, k_greedy]
-            instead of [1, C*H*W], cutting search depth by ~log2(N/k_greedy) and
-            starting from a support that was built to minimise active pixels.
+            Gradient-probe initialisation: one gradient evaluation ranks all
+            elements by saliency; a single sparse_pgd call at the top-probe_frac
+            percentile (default 5% of C*H*W) verifies whether a tight upper bound
+            is achievable.  If it flips, the binary search spans [1, k_probe]
+            instead of [1, C*H*W], cutting ~log2(N / k_probe) ≈ 4-5 levels
+            (≈ 2s saved) and providing a sparser warm start.  If it fails, the
+            full n_active upper bound is used as before.
             """
-            warm_delta = delta1
-
-            if cfg.use_greedy and cfg.sparse:
-                g_delta, g_ok = _greedy_forward(data1, label1, eps, mask)
-                if g_ok:
-                    warm_delta = g_delta  # sparse greedy flip: use as warm start
-
-            di = warm_delta[0]
+            di = delta1[0]
             n_active = int(((di.abs() * 255.0).round() != 0).sum().item())
             if n_active <= 1:
-                return warm_delta
-            best = warm_delta.detach().clone()
-            warm = warm_delta
+                return delta1
+            best = delta1.detach().clone()
+            warm = delta1
+
+            # ── Gradient-probe: try a tight upper bound before binary search ──
+            if cfg.probe_frac > 0.0:
+                g = _grad(data1, label1, delta1)
+                k_probe = max(1, int(round(g.numel() * cfg.probe_frac)))
+                k_probe = min(k_probe, n_active)
+                d_probe, ok_probe, _ = _sparse_pgd(
+                    data1, label1, eps, k_probe, warm,
+                    cfg.sparse_steps, cfg.sparse_restarts, mask=mask,
+                )
+                if ok_probe:
+                    best, warm = d_probe, d_probe
+                    n_active = k_probe  # tighter upper bound verified
+
             lo, hi = 1, n_active
             while lo <= hi:
                 mid = (lo + hi) // 2

@@ -106,9 +106,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--polish-rounds", type=int, default=1, help="Backward-elimination passes after the k search (0 disables)")
     p.add_argument("--flip-margin", type=float, default=1.5, help="Logit margin required when pruning (1.5 allows sparse on marginal flips)")
     p.add_argument("--accept-margin", type=float, default=0.5, help="Logit margin to accept an L-inf level (0.5 accepts thin 1/255 flips)")
-    p.add_argument("--no-greedy", action="store_true", help="Disable greedy forward warm start (use dense PGD warm start as before)")
-    p.add_argument("--greedy-batch", type=int, default=256, help="Elements added per greedy round")
-    p.add_argument("--greedy-pgd-steps", type=int, default=2, help="Sign re-opt PGD steps per greedy round")
+    p.add_argument("--probe-frac", type=float, default=0.05,
+                   help="Gradient-probe fraction: try top-probe_frac elements as binary search upper bound (0=off)")
     p.add_argument("--restart-batch-size", type=int, default=12,
                    help="Restarts to run in parallel on GPU per sub-batch (default 12; matches first_level_restarts)")
     p.add_argument("--device", type=str, default=None, help="cuda / cpu (auto by default)")
@@ -215,8 +214,7 @@ def main() -> int:
         print(f"inner_iters/restarts: {args.inner_iters} / {args.restarts} (level-1 restarts={args.first_level_restarts})")
         print(f"restart_batch_size  : {args.restart_batch_size} (restarts run in parallel on GPU)")
         print(f"sparse              : {not args.no_sparse} (steps={args.sparse_steps}, restarts={args.sparse_restarts}, prune_margin={args.flip_margin})")
-        use_g = not args.no_greedy
-        print(f"greedy_fwd          : {use_g} (batch={args.greedy_batch}, pgd_steps={args.greedy_pgd_steps})")
+        print(f"probe_frac          : {args.probe_frac} ({'on — gradient-probe tight upper bound' if args.probe_frac > 0 else 'off'})")
         print(f"polish_rounds       : {args.polish_rounds} (backward elimination)")
         print(f"accept_margin       : {args.accept_margin} (lower => more images at 1/255)")
     else:
@@ -258,9 +256,7 @@ def main() -> int:
             flip_margin=args.flip_margin,
             accept_margin=args.accept_margin,
             restart_batch_size=args.restart_batch_size,
-            use_greedy=not args.no_greedy,
-            greedy_batch=args.greedy_batch,
-            greedy_pgd_steps=args.greedy_pgd_steps,
+            probe_frac=args.probe_frac,
         )
         attack = build_ops_budget_attack(
             device,
