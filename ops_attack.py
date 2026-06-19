@@ -260,6 +260,16 @@ class BudgetConfig:
     sparse_restarts: int = 1    # restarts of the support-restricted PGD
     polish_rounds: int = 1      # backward-elimination passes after the k search
     restart_batch_size: int = 12  # restarts run in parallel on GPU (match first_level_restarts=12)
+    # ── Greedy forward selection ──────────────────────────────────────────────
+    # Instead of starting sparse binary search from a dense (100%-pixels) PGD
+    # warm point, first build the support from scratch via greedy forward:
+    #   each round adds `greedy_batch` pixels with highest |grad|, then runs a
+    #   short sign-reoptimisation PGD on the growing support.  Stops at the
+    #   first flip, giving the binary search a sparse warm start (typically
+    #   ~1-5% of pixels instead of 100%) and cutting search depth by ~log2(N/k).
+    use_greedy: bool = True      # enable greedy warm start for sparse phase
+    greedy_batch: int = 256      # elements added per greedy round
+    greedy_pgd_steps: int = 2    # sign re-opt PGD steps after each greedy round
 
 
 def _make_budget_forward(cfg: BudgetConfig):
@@ -529,16 +539,144 @@ def _make_budget_forward(cfg: BudgetConfig):
                     cur = cur2
             return cur.detach()
 
+        def _pgd_on_support(data1, label1, delta_init, eps, active_flat):
+            """Short momentum-PGD restricted to a FIXED pixel support.
+
+            Optimises the SIGN pattern of already-chosen pixels without changing
+            which pixels are active.  Non-support elements are forced to zero
+            after every step.  Used by _greedy_forward to re-optimise signs after
+            each batch of new pixels is added.
+
+            ``active_flat`` is a bool 1-D tensor of length C*H*W.
+            """
+            if cfg.greedy_pgd_steps <= 0:
+                return delta_init
+            idx = int(label1.item())
+            delta = delta_init.detach().clone()
+            momentum = torch.zeros_like(delta)
+            alpha = max(eps * cfg.alpha_frac, unit)
+            active_2d = active_flat.float().view_as(delta_init)  # [1,C,H,W] 0/1 mask
+            for _ in range(cfg.greedy_pgd_steps):
+                d = delta.detach().requires_grad_(True)
+                logits = model(torch.clamp(data1 + d, 0.0, 1.0))[0]
+                true_logit = logits[idx]
+                other = logits.clone()
+                other[idx] = float("-inf")
+                g = torch.autograd.grad(other.max() - true_logit, d)[0].detach()
+                g_norm = g / (g.abs().mean() + 1e-12)
+                momentum = cfg.decay * momentum + g_norm
+                # Update only active elements; keep inactive at exactly zero
+                step = alpha * momentum.sign()
+                delta = torch.clamp(delta + step * active_2d, -eps, eps)
+                delta = torch.min(torch.max(delta, -data1), 1.0 - data1)
+                delta = delta * active_2d  # re-zero inactive after bounds clamp
+            return delta
+
+        def _greedy_forward(data1, label1, eps, mask=None):
+            """Greedy forward pixel selection: builds the adversarial support
+            from scratch rather than pruning from a dense PGD result.
+
+            Each round:
+              1. Compute gradient of the margin loss w.r.t. the current delta.
+              2. Add the top `greedy_batch` INACTIVE elements by |gradient|,
+                 setting each to ±eps with sign = sign(gradient).
+              3. Re-optimise the sign pattern of ALL active elements via a short
+                 support-restricted PGD (_pgd_on_support).
+              4. Evaluate; stop as soon as the image flips with margin ≥
+                 accept_margin.
+
+            Returns ``(best_delta, found_flip)``.  If the image never flips
+            within the valid pixel budget, ``found_flip`` is False and the
+            caller should fall back to the dense PGD warm start.
+            """
+            idx = int(label1.item())
+            N = int(data1.numel())  # C*H*W
+            delta = torch.zeros_like(data1)
+            active = torch.zeros(N, dtype=torch.bool, device=data1.device)
+            data_flat = data1.view(-1)  # [N] – read-only reference for bounds
+
+            # Valid pixels: inside the center crop (mask) and in [0,1] range.
+            # mask is [1,1,H,W]; expand to [1,C,H,W] so its flat size matches
+            # N = C*H*W (same layout as active and data_flat).
+            if mask is not None:
+                valid = mask.expand_as(data1).contiguous().view(-1).bool()
+            else:
+                valid = torch.ones(N, dtype=torch.bool, device=data1.device)
+
+            batch = max(1, cfg.greedy_batch)
+            best_delta = delta.clone()
+            best_key = float("-inf")
+
+            while True:
+                n_cand = int((~active & valid).sum().item())
+                if n_cand == 0:
+                    break
+
+                # Gradient of margin loss at current delta
+                d = delta.detach().requires_grad_(True)
+                logits = model(torch.clamp(data1 + d, 0.0, 1.0))[0]
+                true_logit = logits[idx]
+                other = logits.clone()
+                other[idx] = float("-inf")
+                g = torch.autograd.grad(other.max() - true_logit, d)[0].detach().view(-1)
+
+                # Select top-batch inactive valid elements by |gradient|
+                g_sel = g.clone()
+                g_sel[active | ~valid] = 0.0
+                k_add = min(batch, n_cand)
+                top_idx = torch.topk(g_sel.abs(), k_add).indices
+
+                # Assign ±eps respecting pixel value bounds
+                signs = g[top_idx].sign()
+                signs[signs == 0] = 1.0
+                new_vals = (eps * signs).clamp(
+                    -data_flat[top_idx], 1.0 - data_flat[top_idx]
+                )
+                delta_flat = delta.clone().view(-1)
+                delta_flat[top_idx] = new_vals
+                delta = delta_flat.view_as(data1)
+                active[top_idx] = True
+
+                # Re-optimise signs of the full active support
+                delta = _pgd_on_support(data1, label1, delta, eps, active)
+
+                # Track best across all rounds
+                gates, _, margin = _eval(model, data1, label1, delta)
+                key = margin + (1000.0 if gates else 0.0)
+                if key > best_key:
+                    best_key = key
+                    best_delta = delta.clone()
+
+                if gates and margin >= cfg.accept_margin:
+                    return best_delta, True  # found a flip — stop early
+
+            # Exhausted all valid pixels without a flip
+            gates, _, margin = _eval(model, data1, label1, best_delta)
+            return best_delta, (gates and margin >= cfg.accept_margin)
+
         def _sparse_one(data1, label1, delta1, eps, mask=None):
             """Binary-search the minimum number of perturbed elements (k) for
             which support-restricted PGD still passes every gate + flip_margin,
-            then greedily polish away any remaining redundant pixels."""
-            di = delta1[0]
+            then greedily polish away any remaining redundant pixels.
+
+            When ``cfg.use_greedy`` is True, first runs ``_greedy_forward`` to
+            obtain a sparse warm start.  The binary search then spans [1, k_greedy]
+            instead of [1, C*H*W], cutting search depth by ~log2(N/k_greedy) and
+            starting from a support that was built to minimise active pixels.
+            """
+            warm_delta = delta1
+
+            if cfg.use_greedy and cfg.sparse:
+                g_delta, g_ok = _greedy_forward(data1, label1, eps, mask)
+                if g_ok:
+                    warm_delta = g_delta  # sparse greedy flip: use as warm start
+
+            di = warm_delta[0]
             n_active = int(((di.abs() * 255.0).round() != 0).sum().item())
             if n_active <= 1:
-                return delta1
-            best = delta1.detach().clone()
-            warm = delta1
+                return warm_delta
+            best = warm_delta.detach().clone()
+            warm = warm_delta
             lo, hi = 1, n_active
             while lo <= hi:
                 mid = (lo + hi) // 2
