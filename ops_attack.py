@@ -156,6 +156,49 @@ def forwards_per_image(
     return int(num_iter) * per_step
 
 
+# ─── Center-crop mask ──────────────────────────────────────────────────────────
+
+
+def _center_crop_mask(
+    H: int, W: int, device: torch.device, crop_size: int = 480
+) -> torch.Tensor:
+    """Return a (1, 1, H, W) float32 binary mask covering the center-crop window.
+
+    EfficientNetV2-L preprocessing: torchvision Resize(480) resizes the shorter
+    side to 480 via int-truncation, then CenterCrop(480) takes the center square.
+    Pixels *outside* this window are invisible to the model (gradient == 0 through
+    the crop op), so zeroing their perturbation never hurts classification but
+    always lowers RMSE — a free score gain.
+
+    For non-square images the wasted area is 10–34% of total pixels (measured on
+    the benchmark dataset which stores images at ~160px shortest side).
+    """
+    if H == W:
+        return torch.ones(1, 1, H, W, device=device)
+
+    # torchvision Resize(crop_size) with a single int:
+    #   shorter side → crop_size; other → int(other * crop_size / shorter)
+    if H <= W:
+        new_H, new_W = crop_size, int(W * crop_size / H)
+    else:
+        new_H, new_W = int(H * crop_size / W), crop_size
+
+    crop_top = (new_H - crop_size) // 2
+    crop_left = (new_W - crop_size) // 2
+
+    scale_y = new_H / H
+    scale_x = new_W / W
+    # Conservative (inclusive) mapping back to original pixel coordinates
+    y0 = max(0, int(math.floor(crop_top / scale_y)))
+    y1 = min(H, int(math.ceil((crop_top + crop_size) / scale_y)))
+    x0 = max(0, int(math.floor(crop_left / scale_x)))
+    x1 = min(W, int(math.ceil((crop_left + crop_size) / scale_x)))
+
+    m = torch.zeros(1, 1, H, W, device=device)
+    m[:, :, y0:y1, x0:x1] = 1.0
+    return m
+
+
 # ─── Budget-minimizing (L-inf / SSIM-aware) objective ──────────────────────────
 #
 # Vanilla OPS only maximises cross-entropy: it flips the label but spends the
@@ -201,22 +244,28 @@ class BudgetConfig:
     """
 
     max_level: int = 7          # max L-inf in 1/255 units (floor(0.03*255) == 7)
-    inner_iters: int = 15       # PGD steps per level  (60 -> 15: level search is <2s)
+    inner_iters: int = 18       # PGD steps per level  (15 -> 18: stronger convergence)
     restarts: int = 2           # PGD restarts per level (>=1; >1 adds random init)
-    first_level_restarts: int = 8  # extra restarts at level 1 (the 0.7-weighted floor)
+    first_level_restarts: int = 12  # extra restarts at level 1 (8 -> 12: more exploration, all in one rbs=12 batch)
     alpha_frac: float = 0.5     # PGD step size as a fraction of eps (>= 1/255)
     decay: float = 1.0          # momentum decay
     min_delta: float = MIN_LINF_DELTA
     min_ssim: float = MIN_SSIM
     min_psnr_db: float = MIN_PSNR_DB
     eff_max_eps: float = MAX_LINF_DELTA
-    flip_margin: float = 2.0    # logit margin required when PRUNING (conservative)
-    accept_margin: float = 1.0  # logit margin to accept an L-inf level (see note)
+    flip_margin: float = 1.5    # logit margin required when PRUNING (2.0 -> 1.5: allows sparse on marginal flips)
+    accept_margin: float = 0.5  # logit margin to accept an L-inf level (1.0 -> 0.5: accept thin 1/255 flips)
     sparse: bool = True
-    sparse_steps: int = 8       # PGD steps per support size in the k binary search (50 -> 8)
-    sparse_restarts: int = 1    # restarts of the support-restricted PGD (2 -> 1)
-    polish_rounds: int = 1      # backward-elimination passes after the k search (3 -> 1)
-    restart_batch_size: int = 8  # restarts run in parallel on GPU (tune to VRAM)
+    sparse_steps: int = 8       # PGD steps per support size in the k binary search
+    sparse_restarts: int = 1    # restarts of the support-restricted PGD
+    polish_rounds: int = 1      # backward-elimination passes after the k search
+    restart_batch_size: int = 12  # restarts run in parallel on GPU (match first_level_restarts=12)
+    # ── Gradient-probe binary search initialisation ───────────────────────────
+    # After PGD, count the elements in the top `probe_frac` fraction by gradient
+    # magnitude and try that many as the first sparse_pgd call.  If it flips, use
+    # it as the tighter upper bound for the binary search (saving ~5 levels ≈ 2s).
+    # If it fails, fall back to the full n_active upper bound as before.
+    probe_frac: float = 0.05     # top fraction of elements to probe (5% of C*H*W)
 
 
 def _make_budget_forward(cfg: BudgetConfig):
@@ -273,7 +322,7 @@ def _make_budget_forward(cfg: BudgetConfig):
             loss = other.max() - true_logit
             return torch.autograd.grad(loss, d)[0].detach()
 
-        def _pgd_at_level(data1, label1, level, init=None, restarts=None, target=None):
+        def _pgd_at_level(data1, label1, level, init=None, restarts=None, target=None, mask=None):
             """Strong margin-PGD constrained to L-inf = level/255.
 
             Restarts are processed in parallel sub-batches of cfg.restart_batch_size
@@ -284,6 +333,10 @@ def _make_budget_forward(cfg: BudgetConfig):
             solutions and then the largest flip margin. ``target`` enables early-stop
             across sub-batches: once any restart passes gates with margin >= target,
             remaining sub-batches are skipped.
+
+            ``mask`` (optional, [1,1,H,W]) zeros perturbation outside the model's
+            center-crop window — those pixels are invisible to the classifier so
+            zeroing them is a free RMSE reduction.
             """
             eps = level * unit
             alpha = max(eps * cfg.alpha_frac, unit)
@@ -300,6 +353,8 @@ def _make_budget_forward(cfg: BudgetConfig):
                     d = torch.zeros_like(data1)
                 else:
                     d = torch.empty_like(data1).uniform_(-eps, eps)
+                    if mask is not None:
+                        d = d * mask  # zero outside-crop pixels in random restarts
                 inits.append(torch.min(torch.max(d, -data1), 1.0 - data1))
 
             best_delta = None
@@ -328,6 +383,8 @@ def _make_budget_forward(cfg: BudgetConfig):
                     delta_b = delta_b + alpha * momentum_b.sign()
                     delta_b = delta_b.clamp(-eps, eps)
                     delta_b = torch.min(torch.max(delta_b, -data_b), 1.0 - data_b)
+                    if mask is not None:
+                        delta_b = delta_b * mask  # enforce zero outside center crop
 
                 # Evaluate each restart and track the best
                 for r in range(bs):
@@ -342,7 +399,7 @@ def _make_budget_forward(cfg: BudgetConfig):
 
             return best_delta
 
-        def _sparse_pgd(data1, label1, eps, k, init, steps, restarts=1):
+        def _sparse_pgd(data1, label1, eps, k, init, steps, restarts=1, mask=None):
             """Iterative hard-thresholding PGD: keep the top-k gradient-salient
             elements at +/-eps and re-optimise their sign pattern each step.
 
@@ -352,6 +409,10 @@ def _make_budget_forward(cfg: BudgetConfig):
 
             Restarts are processed in parallel sub-batches of cfg.restart_batch_size.
             Returns the best (delta, ok, margin) over all restarts.
+
+            ``mask`` (optional, [1,1,H,W]) zeroes outside-crop pixels in random
+            restarts; crop pixels are naturally preferred by top-k once momentum
+            accumulates since outside pixels always have zero gradient.
             """
             numel = init.numel()  # C*H*W per image
             n_restarts = max(1, int(restarts))
@@ -364,6 +425,8 @@ def _make_budget_forward(cfg: BudgetConfig):
                     d = init.detach().clone()
                 else:
                     d = torch.empty_like(data1).uniform_(-eps, eps)
+                    if mask is not None:
+                        d = d * mask  # zero outside-crop pixels in random restarts
                     d = torch.min(torch.max(d, -data1), 1.0 - data1)
                 inits.append(d)
 
@@ -388,16 +451,16 @@ def _make_budget_forward(cfg: BudgetConfig):
                     grads = torch.autograd.grad(loss, d)[0].detach()   # [bs, C, H, W]
                     g_norm = grads / (grads.abs().mean(dim=(1, 2, 3), keepdim=True) + 1e-12)
                     momentum_b = cfg.decay * momentum_b + g_norm
-                    # Top-k mask applied per restart independently
+                    # Top-k support applied per restart independently
                     flat_m = momentum_b.abs().view(bs, -1)              # [bs, chw]
                     if k < chw:
                         topk_idx = torch.topk(flat_m, k, dim=1).indices
-                        mask = torch.zeros(bs, chw, dtype=torch.bool, device=delta_b.device)
-                        mask.scatter_(1, topk_idx, True)
-                        mask = mask.view_as(momentum_b)
+                        support = torch.zeros(bs, chw, dtype=torch.bool, device=delta_b.device)
+                        support.scatter_(1, topk_idx, True)
+                        support = support.view_as(momentum_b)
                     else:
-                        mask = torch.ones_like(momentum_b, dtype=torch.bool)
-                    delta_b = mask * (eps * momentum_b.sign())
+                        support = torch.ones_like(momentum_b, dtype=torch.bool)
+                    delta_b = support * (eps * momentum_b.sign())
                     delta_b = torch.min(torch.max(delta_b, -data_b), 1.0 - data_b)
 
                 # Evaluate each restart; prefer passing + fewest active pixels + margin
@@ -415,7 +478,7 @@ def _make_budget_forward(cfg: BudgetConfig):
             gates, _, margin = _eval(model, data1, label1, best_delta)
             return best_delta, (gates and margin >= cfg.flip_margin), margin
 
-        def _polish(data1, label1, delta1, eps):
+        def _polish(data1, label1, delta1, eps, mask=None):
             """Greedy backward elimination after the k search.
 
             The top-k support PGD returns keeps the k most salient pixels, but
@@ -466,39 +529,184 @@ def _make_budget_forward(cfg: BudgetConfig):
                 # (restarts=1): polish already has a good support, so random
                 # reseeds here add downside risk without RMSE benefit.
                 cur2, ok, _ = _sparse_pgd(
-                    data1, label1, eps, k, cur, cfg.sparse_steps, restarts=1
+                    data1, label1, eps, k, cur, cfg.sparse_steps, restarts=1, mask=mask
                 )
                 if ok:
                     cur = cur2
             return cur.detach()
 
-        def _sparse_one(data1, label1, delta1, eps):
+        def _pgd_on_support(data1, label1, delta_init, eps, active_flat):
+            """Short momentum-PGD restricted to a FIXED pixel support.
+
+            Optimises the SIGN pattern of already-chosen pixels without changing
+            which pixels are active.  Non-support elements are forced to zero
+            after every step.  Used by _greedy_forward to re-optimise signs after
+            each batch of new pixels is added.
+
+            ``active_flat`` is a bool 1-D tensor of length C*H*W.
+            """
+            if cfg.greedy_pgd_steps <= 0:
+                return delta_init
+            idx = int(label1.item())
+            delta = delta_init.detach().clone()
+            momentum = torch.zeros_like(delta)
+            alpha = max(eps * cfg.alpha_frac, unit)
+            active_2d = active_flat.float().view_as(delta_init)  # [1,C,H,W] 0/1 mask
+            for _ in range(cfg.greedy_pgd_steps):
+                d = delta.detach().requires_grad_(True)
+                logits = model(torch.clamp(data1 + d, 0.0, 1.0))[0]
+                true_logit = logits[idx]
+                other = logits.clone()
+                other[idx] = float("-inf")
+                g = torch.autograd.grad(other.max() - true_logit, d)[0].detach()
+                g_norm = g / (g.abs().mean() + 1e-12)
+                momentum = cfg.decay * momentum + g_norm
+                # Update only active elements; keep inactive at exactly zero
+                step = alpha * momentum.sign()
+                delta = torch.clamp(delta + step * active_2d, -eps, eps)
+                delta = torch.min(torch.max(delta, -data1), 1.0 - data1)
+                delta = delta * active_2d  # re-zero inactive after bounds clamp
+            return delta
+
+        def _greedy_forward(data1, label1, eps, mask=None):
+            """Greedy forward pixel selection: builds the adversarial support
+            from scratch rather than pruning from a dense PGD result.
+
+            Each round:
+              1. Compute gradient of the margin loss w.r.t. the current delta.
+              2. Add the top `greedy_batch` INACTIVE elements by |gradient|,
+                 setting each to ±eps with sign = sign(gradient).
+              3. Re-optimise the sign pattern of ALL active elements via a short
+                 support-restricted PGD (_pgd_on_support).
+              4. Evaluate; stop as soon as the image flips with margin ≥
+                 accept_margin.
+
+            Returns ``(best_delta, found_flip)``.  If the image never flips
+            within the valid pixel budget, ``found_flip`` is False and the
+            caller should fall back to the dense PGD warm start.
+            """
+            idx = int(label1.item())
+            N = int(data1.numel())  # C*H*W
+            delta = torch.zeros_like(data1)
+            active = torch.zeros(N, dtype=torch.bool, device=data1.device)
+            data_flat = data1.view(-1)  # [N] – read-only reference for bounds
+
+            # Valid pixels: inside the center crop (mask) and in [0,1] range.
+            # mask is [1,1,H,W]; expand to [1,C,H,W] so its flat size matches
+            # N = C*H*W (same layout as active and data_flat).
+            if mask is not None:
+                valid = mask.expand_as(data1).contiguous().view(-1).bool()
+            else:
+                valid = torch.ones(N, dtype=torch.bool, device=data1.device)
+
+            batch = max(1, cfg.greedy_batch)
+            best_delta = delta.clone()
+            best_key = float("-inf")
+
+            while True:
+                n_cand = int((~active & valid).sum().item())
+                if n_cand == 0:
+                    break
+
+                # Gradient of margin loss at current delta
+                d = delta.detach().requires_grad_(True)
+                logits = model(torch.clamp(data1 + d, 0.0, 1.0))[0]
+                true_logit = logits[idx]
+                other = logits.clone()
+                other[idx] = float("-inf")
+                g = torch.autograd.grad(other.max() - true_logit, d)[0].detach().view(-1)
+
+                # Select top-batch inactive valid elements by |gradient|
+                g_sel = g.clone()
+                g_sel[active | ~valid] = 0.0
+                k_add = min(batch, n_cand)
+                top_idx = torch.topk(g_sel.abs(), k_add).indices
+
+                # Assign ±eps respecting pixel value bounds
+                signs = g[top_idx].sign()
+                signs[signs == 0] = 1.0
+                new_vals = (eps * signs).clamp(
+                    -data_flat[top_idx], 1.0 - data_flat[top_idx]
+                )
+                delta_flat = delta.clone().view(-1)
+                delta_flat[top_idx] = new_vals
+                delta = delta_flat.view_as(data1)
+                active[top_idx] = True
+
+                # Re-optimise signs of the full active support
+                delta = _pgd_on_support(data1, label1, delta, eps, active)
+
+                # Track best across all rounds
+                gates, _, margin = _eval(model, data1, label1, delta)
+                key = margin + (1000.0 if gates else 0.0)
+                if key > best_key:
+                    best_key = key
+                    best_delta = delta.clone()
+
+                if gates and margin >= cfg.accept_margin:
+                    return best_delta, True  # found a flip — stop early
+
+            # Exhausted all valid pixels without a flip
+            gates, _, margin = _eval(model, data1, label1, best_delta)
+            return best_delta, (gates and margin >= cfg.accept_margin)
+
+        def _sparse_one(data1, label1, delta1, eps, mask=None):
             """Binary-search the minimum number of perturbed elements (k) for
             which support-restricted PGD still passes every gate + flip_margin,
-            then greedily polish away any remaining redundant pixels."""
+            then greedily polish away any remaining redundant pixels.
+
+            Gradient-probe initialisation: one gradient evaluation ranks all
+            elements by saliency; a single sparse_pgd call at the top-probe_frac
+            percentile (default 5% of C*H*W) verifies whether a tight upper bound
+            is achievable.  If it flips, the binary search spans [1, k_probe]
+            instead of [1, C*H*W], cutting ~log2(N / k_probe) ≈ 4-5 levels
+            (≈ 2s saved) and providing a sparser warm start.  If it fails, the
+            full n_active upper bound is used as before.
+            """
             di = delta1[0]
             n_active = int(((di.abs() * 255.0).round() != 0).sum().item())
             if n_active <= 1:
                 return delta1
             best = delta1.detach().clone()
             warm = delta1
+
+            # ── Gradient-probe: try a tight upper bound before binary search ──
+            if cfg.probe_frac > 0.0:
+                g = _grad(data1, label1, delta1)
+                k_probe = max(1, int(round(g.numel() * cfg.probe_frac)))
+                k_probe = min(k_probe, n_active)
+                d_probe, ok_probe, _ = _sparse_pgd(
+                    data1, label1, eps, k_probe, warm,
+                    cfg.sparse_steps, cfg.sparse_restarts, mask=mask,
+                )
+                if ok_probe:
+                    best, warm = d_probe, d_probe
+                    n_active = k_probe  # tighter upper bound verified
+
             lo, hi = 1, n_active
             while lo <= hi:
                 mid = (lo + hi) // 2
                 d, ok, _ = _sparse_pgd(
-                    data1, label1, eps, mid, warm, cfg.sparse_steps, cfg.sparse_restarts
+                    data1, label1, eps, mid, warm, cfg.sparse_steps, cfg.sparse_restarts,
+                    mask=mask,
                 )
                 if ok:
                     best, warm = d, d
                     hi = mid - 1
                 else:
                     lo = mid + 1
-            return _polish(data1, label1, best, eps)
+            return _polish(data1, label1, best, eps, mask=mask)
 
         outs = []
         for i in range(int(data.shape[0])):
             data1 = data[i : i + 1]
             label1 = label[i : i + 1]
+
+            # Compute center-crop mask: pixels outside the 480×480 crop window
+            # are invisible to EfficientNetV2-L (gradient == 0 through the crop
+            # op), so we zero them in every delta — a free RMSE reduction.
+            H, W = data1.shape[2], data1.shape[3]
+            crop_mask = _center_crop_mask(H, W, device)  # [1, 1, H, W]
 
             # Ascending, SCORE-AWARE level search. The L-inf term carries 0.7
             # weight, so a lower level almost always wins even if it costs all
@@ -522,6 +730,7 @@ def _make_budget_forward(cfg: BudgetConfig):
                 d = _pgd_at_level(
                     data1, label1, level,
                     init=warm, restarts=n_restarts, target=cfg.flip_margin,
+                    mask=crop_mask,
                 )
                 warm = d
                 gates, _, margin = _eval(model, data1, label1, d)
@@ -532,7 +741,8 @@ def _make_budget_forward(cfg: BudgetConfig):
                 chosen = warm  # best effort (nothing flipped within budget)
 
             if cfg.sparse and chosen_ok:
-                chosen = _sparse_one(data1, label1, chosen, chosen_level * unit)
+                chosen = _sparse_one(data1, label1, chosen, chosen_level * unit,
+                                     mask=crop_mask)
             outs.append(chosen.detach())
 
         return torch.cat(outs, dim=0)

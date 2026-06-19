@@ -6,7 +6,7 @@ setup(
     version="0.1.0",
     description="Perturb Bittensor subnet (adversarial image attacks)",
     packages=find_packages(),
-    py_modules=["ops_attack", "model_utils"],
+    py_modules=["ops_attack", "cwa_attack", "l2t_attack", "model_utils"],
     include_package_data=True,
     install_requires=[
         "bittensor>=8.0.0",

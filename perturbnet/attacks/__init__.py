@@ -21,6 +21,8 @@ import torch
 
 from perturbnet.attacks.base import AttackResult, AttackRunner, ProfileSummaryFn
 from perturbnet.attacks import apgd_cw as apgd_cw_module
+from perturbnet.attacks import cwa_budget as cwa_budget_module
+from perturbnet.attacks import l2t_budget as l2t_budget_module
 from perturbnet.attacks import magi as magi_module
 from perturbnet.attacks import ops_budget as ops_budget_module
 from perturbnet.attacks import sma_mi_fgsm as sma_mi_fgsm_module
@@ -49,6 +51,12 @@ def _normalize_algorithm_key(raw: str) -> str:
         "ops": "ops_budget",
         "ops_budget": "ops_budget",
         "ops_attack": "ops_budget",
+        "cwa": "cwa_budget",
+        "cwa_budget": "cwa_budget",
+        "cwa_ensemble": "cwa_budget",
+        "l2t": "l2t_budget",
+        "l2t_budget": "l2t_budget",
+        "learning_to_transform": "l2t_budget",
     }
     return aliases.get(key, key)
 
@@ -77,6 +85,18 @@ _REGISTRY: dict[str, _RegisteredAttack] = {
         title=ops_budget_module.ALGORITHM_NAME,
         runner=ops_budget_module.run_ops_budget,
         profile_summary=ops_budget_module.runtime_profile_summary,
+    ),
+    "cwa_budget": _RegisteredAttack(
+        key="cwa_budget",
+        title=cwa_budget_module.ALGORITHM_NAME,
+        runner=cwa_budget_module.run_cwa_budget,
+        profile_summary=cwa_budget_module.runtime_profile_summary,
+    ),
+    "l2t_budget": _RegisteredAttack(
+        key="l2t_budget",
+        title=l2t_budget_module.ALGORITHM_NAME,
+        runner=l2t_budget_module.run_l2t_budget,
+        profile_summary=l2t_budget_module.runtime_profile_summary,
     ),
 }
 

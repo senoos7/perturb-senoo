@@ -36,6 +36,8 @@ if str(MY_WORK) not in sys.path:
     sys.path.insert(0, str(MY_WORK))
 
 from local_index import discover_npy_rows, load_label_index  # noqa: E402
+from cwa_attack import CWABudgetConfig, build_cwa_budget_attack  # noqa: E402
+from l2t_attack import L2TBudgetConfig, build_l2t_budget_attack  # noqa: E402
 from ops_attack import (  # noqa: E402
     QUANT_SAFE_MAX_LINF,
     BudgetConfig,
@@ -73,9 +75,11 @@ def parse_args() -> argparse.Namespace:
                    help="Explicit row ids (overrides random sampling)")
     p.add_argument("--seed", type=int, default=0, help="Sampling/attack seed")
     # objective
-    p.add_argument("--objective", choices=["ce", "budget"], default="budget",
+    p.add_argument("--objective", choices=["ce", "budget", "cwa", "l2t"], default="budget",
                    help="ce = vanilla OPS (max cross-entropy); "
-                        "budget = minimum-norm L-inf/SSIM-aware (default)")
+                        "budget = OPS minimum-norm (default); "
+                        "cwa = CWA ensemble + budget; "
+                        "l2t = L2T policy-gradient augmentation + budget")
     # challenge / scoring
     p.add_argument("--challenge-epsilon", type=float, default=0.0,
                    help="Challenge epsilon; 0 = sample per image in [0.06, 0.2] like the validator")
@@ -92,18 +96,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--random-start", action="store_true")
     # budget objective (only used when --objective budget)
     p.add_argument("--max-level", type=int, default=7, help="Max L-inf level in 1/255 units (<=7)")
-    p.add_argument("--inner-iters", type=int, default=15, help="PGD steps per L-inf level")
+    p.add_argument("--inner-iters", type=int, default=18, help="PGD steps per L-inf level")
     p.add_argument("--restarts", type=int, default=2, help="PGD restarts per level (>1 adds random init)")
-    p.add_argument("--first-level-restarts", type=int, default=8, help="Extra PGD restarts at level 1 (1/255 floor)")
+    p.add_argument("--first-level-restarts", type=int, default=12, help="Extra PGD restarts at level 1 (1/255 floor)")
     p.add_argument("--alpha-frac", type=float, default=0.5, help="PGD step size as fraction of eps")
     p.add_argument("--no-sparse", action="store_true", help="Disable L0 sparse refinement")
     p.add_argument("--sparse-steps", type=int, default=8, help="PGD steps per support size in k binary search")
     p.add_argument("--sparse-restarts", type=int, default=1, help="Restarts of support-restricted PGD (>1 random reseed)")
     p.add_argument("--polish-rounds", type=int, default=1, help="Backward-elimination passes after the k search (0 disables)")
-    p.add_argument("--flip-margin", type=float, default=2.0, help="Logit margin required when pruning (conservative)")
-    p.add_argument("--accept-margin", type=float, default=1.0, help="Logit margin to accept an L-inf level (lower => more 1/255)")
-    p.add_argument("--restart-batch-size", type=int, default=8,
-                   help="Restarts to run in parallel on GPU per sub-batch (default 8 ~= 20 GB VRAM; raise for more GPU util)")
+    p.add_argument("--flip-margin", type=float, default=1.5, help="Logit margin required when pruning (1.5 allows sparse on marginal flips)")
+    p.add_argument("--accept-margin", type=float, default=0.5, help="Logit margin to accept an L-inf level (0.5 accepts thin 1/255 flips)")
+    p.add_argument("--probe-frac", type=float, default=0.05,
+                   help="Gradient-probe fraction: try top-probe_frac elements as binary search upper bound (0=off)")
+    p.add_argument("--restart-batch-size", type=int, default=12,
+                   help="Restarts to run in parallel on GPU per sub-batch (default 12; matches first_level_restarts)")
     p.add_argument("--device", type=str, default=None, help="cuda / cpu (auto by default)")
     return p.parse_args()
 
@@ -167,35 +173,76 @@ def main() -> int:
         pass
 
     if args.objective == "budget":
-        # ~ levels searched (binary search over 1..max_level) * restarts * inner_iters
         levels = max(1, int(round(math.log2(max(1, args.max_level)))) + 1)
         fpi = levels * max(1, args.restarts) * args.inner_iters
         fpi *= max(1, forwards_per_image(1, args.num_sample_neighbor, args.num_sample_operator))
+    elif args.objective == "cwa":
+        cwa_cfg_preview = CWABudgetConfig()
+        fpi = (cwa_cfg_preview.cwa_epochs * 3 * 2
+               + cwa_cfg_preview.max_level * cwa_cfg_preview.inner_iters)
+    elif args.objective == "l2t":
+        l2t_cfg_preview = L2TBudgetConfig()
+        fpi = (l2t_cfg_preview.l2t_epochs * l2t_cfg_preview.num_scale
+               + l2t_cfg_preview.max_level * l2t_cfg_preview.inner_iters)
     else:
         fpi = forwards_per_image(args.num_iter, args.num_sample_neighbor, args.num_sample_operator)
+
     print(f"device              : {device}")
     print(f"split / samples_dir : {args.split}  {samples_dir}")
     print(f"images              : {len(rows)}")
     print(f"objective           : {args.objective}")
     print(f"challenge_epsilon   : {'sampled[0.06,0.2]' if args.challenge_epsilon <= 0 else args.challenge_epsilon}")
-    print(f"OPS sampling        : neighbor={args.num_sample_neighbor} operator={args.num_sample_operator}")
-    if args.objective == "budget":
+
+    if args.objective == "l2t":
+        l2t_p = L2TBudgetConfig()
+        print(f"L2T epochs          : {l2t_p.l2t_epochs}  (num_scale={l2t_p.num_scale}, ops_num={l2t_p.ops_num}, aug_lr={l2t_p.aug_lr})")
+        print(f"L2T op library      : {len(__import__('l2t_attack')._OP_TABLE)} size-agnostic transforms")
+        print(f"max_level           : {l2t_p.max_level} ({l2t_p.max_level}/255 = {l2t_p.max_level/255:.5f})")
+        print(f"inner_iters/restarts: {l2t_p.inner_iters} / {l2t_p.restarts} (level-1 restarts={l2t_p.first_level_restarts})")
+        print(f"sparse              : {l2t_p.sparse} (steps={l2t_p.sparse_steps}, restarts={l2t_p.sparse_restarts})")
+        print(f"polish_rounds       : {l2t_p.polish_rounds}")
+    elif args.objective == "cwa":
+        cwa_cfg_preview = CWABudgetConfig()
+        print(f"CWA epochs          : {cwa_cfg_preview.cwa_epochs}  (K=3: EfficientNetV2-L + ResNet50 + MobileNetV2)")
+        print(f"max_level           : {cwa_cfg_preview.max_level} ({cwa_cfg_preview.max_level}/255 = {cwa_cfg_preview.max_level/255:.5f})")
+        print(f"inner_iters/restarts: {cwa_cfg_preview.inner_iters} / {cwa_cfg_preview.restarts} (level-1 restarts={cwa_cfg_preview.first_level_restarts})")
+        print(f"sparse              : {cwa_cfg_preview.sparse} (steps={cwa_cfg_preview.sparse_steps}, restarts={cwa_cfg_preview.sparse_restarts})")
+        print(f"polish_rounds       : {cwa_cfg_preview.polish_rounds}")
+    elif args.objective == "budget":
+        print(f"OPS sampling        : neighbor={args.num_sample_neighbor} operator={args.num_sample_operator}")
         print(f"max_level           : {args.max_level} ({args.max_level}/255 = {args.max_level/255:.5f})")
         print(f"inner_iters/restarts: {args.inner_iters} / {args.restarts} (level-1 restarts={args.first_level_restarts})")
         print(f"restart_batch_size  : {args.restart_batch_size} (restarts run in parallel on GPU)")
         print(f"sparse              : {not args.no_sparse} (steps={args.sparse_steps}, restarts={args.sparse_restarts}, prune_margin={args.flip_margin})")
+        print(f"probe_frac          : {args.probe_frac} ({'on — gradient-probe tight upper bound' if args.probe_frac > 0 else 'off'})")
         print(f"polish_rounds       : {args.polish_rounds} (backward elimination)")
         print(f"accept_margin       : {args.accept_margin} (lower => more images at 1/255)")
     else:
+        print(f"OPS sampling        : neighbor={args.num_sample_neighbor} operator={args.num_sample_operator}")
         print(f"attack_epsilon      : {args.attack_epsilon}")
         print(f"num_iter            : {args.num_iter}")
     print(f"forwards/image (est): ~{fpi}")
-    if args.num_sample_neighbor * args.num_sample_operator == 0:
-        print("flip direction      : true gradient (sampling off) -> EfficientNetV2-L overfit")
+    if args.objective == "l2t":
+        print("flip direction      : L2T learned policy over 21 augmentation ops")
+    elif args.objective == "cwa":
+        print("flip direction      : CWA ensemble consensus (EfficientNetV2-L + ResNet50 + MobileNetV2)")
     else:
-        print("flip direction      : full OPS (operator+neighbor sampling)")
+        if args.num_sample_neighbor * args.num_sample_operator == 0:
+            print("flip direction      : true gradient (sampling off) -> EfficientNetV2-L overfit")
+        else:
+            print("flip direction      : full OPS (operator+neighbor sampling)")
 
-    if args.objective == "budget":
+    if args.objective == "l2t":
+        l2t_cfg = L2TBudgetConfig()
+        attack = build_l2t_budget_attack(device, cfg=l2t_cfg)
+        from model_utils import load_frozen_classifier
+        model = load_frozen_classifier(device)
+    elif args.objective == "cwa":
+        cwa_cfg = CWABudgetConfig()
+        attack = build_cwa_budget_attack(device, cfg=cwa_cfg)
+        from model_utils import load_frozen_classifier
+        model = load_frozen_classifier(device)
+    elif args.objective == "budget":
         cfg = BudgetConfig(
             max_level=args.max_level,
             inner_iters=args.inner_iters,
@@ -209,6 +256,7 @@ def main() -> int:
             flip_margin=args.flip_margin,
             accept_margin=args.accept_margin,
             restart_batch_size=args.restart_batch_size,
+            probe_frac=args.probe_frac,
         )
         attack = build_ops_budget_attack(
             device,
@@ -218,6 +266,7 @@ def main() -> int:
             decay=args.decay,
             budget=cfg,
         )
+        model = attack.model.model  # raw EfficientNetV2-L
     else:
         attack = build_ops_attack(
             device,
@@ -229,7 +278,7 @@ def main() -> int:
             decay=args.decay,
             random_start=args.random_start,
         )
-    model = attack.model.model  # raw EfficientNetV2-L for validator-mirror scoring
+        model = attack.model.model  # raw EfficientNetV2-L
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -265,7 +314,11 @@ def main() -> int:
         torch.manual_seed(args.seed + row)
 
         started = time.perf_counter()
-        delta = attack(clean, label)
+        if args.objective == "cwa":
+            # CWA returns delta directly from the callable
+            delta = attack(clean, label)
+        else:
+            delta = attack(clean, label)
         adv = torch.clamp(clean + delta, 0.0, 1.0)
         if device.type == "cuda":
             torch.cuda.synchronize()
