@@ -22,6 +22,13 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return float(raw)
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
@@ -42,6 +49,7 @@ def _budget_config_from_env() -> BudgetConfig:
         sparse_restarts=_env_int("OPS_SPARSE_RESTARTS", cfg.sparse_restarts),
         polish_rounds=_env_int("OPS_POLISH_ROUNDS", cfg.polish_rounds),
         restart_batch_size=_env_int("OPS_RESTART_BATCH_SIZE", cfg.restart_batch_size),
+        probe_frac=_env_float("OPS_PROBE_FRAC", cfg.probe_frac),
     )
 
 
@@ -62,6 +70,7 @@ def _get_attack(device: torch.device):
         cfg.sparse_restarts,
         cfg.polish_rounds,
         cfg.restart_batch_size,
+        cfg.probe_frac,
     )
     with _lock:
         attack = _cached.get(key)
@@ -113,5 +122,5 @@ def runtime_profile_summary() -> str:
         f"first_level_restarts={cfg.first_level_restarts} "
         f"sparse={cfg.sparse} sparse_steps={cfg.sparse_steps} "
         f"sparse_restarts={cfg.sparse_restarts} polish_rounds={cfg.polish_rounds} "
-        f"restart_batch_size={cfg.restart_batch_size}"
+        f"restart_batch_size={cfg.restart_batch_size} probe_frac={cfg.probe_frac}"
     )
