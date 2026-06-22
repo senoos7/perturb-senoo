@@ -13,7 +13,6 @@ import torch
 from perturbnet.attacks import list_attack_algorithms, run_attack, runtime_profile_summary
 from perturbnet.constants import (
     CHALLENGE_SAVE_DIR,
-    MINER_VALIDATOR_IP_WHITELIST,
     R2_UPLOAD_CHALLENGES,
     SAVE_CHALLENGE_IMAGES,
 )
@@ -28,52 +27,6 @@ from perturbnet.protocol import AttackChallenge
 from perturbnet.r2_storage import ChallengeR2Uploader
 
 logger = pylogging.getLogger(__name__)
-
-# Disable with MINER_VALIDATOR_IP_WHITELIST=off
-_IP_WHITELIST_DISABLED = frozenset({"off", "false", "0", "no", "*", "all"})
-
-
-def _parse_validator_ip_whitelist(raw: str) -> list[tuple[str, int | None]]:
-    """Parse comma-separated entries: ``ip`` or ``ip:axon_port``."""
-    entries: list[tuple[str, int | None]] = []
-    for part in raw.split(","):
-        item = part.strip()
-        if not item:
-            continue
-        if ":" in item:
-            ip, port_raw = item.rsplit(":", 1)
-            entries.append((ip.strip(), int(port_raw.strip())))
-        else:
-            entries.append((item, None))
-    return entries
-
-
-def _caller_ip_whitelisted(
-    *,
-    caller_ip: str | None,
-    caller_uid: int | None,
-    metagraph: typing.Any,
-    whitelist: list[tuple[str, int | None]],
-) -> tuple[bool, str]:
-    if not caller_ip:
-        return False, "Missing caller IP"
-    for allowed_ip, allowed_axon_port in whitelist:
-        if caller_ip != allowed_ip:
-            continue
-        if allowed_axon_port is None:
-            return True, "OK"
-        if caller_uid is None:
-            return False, f"Caller IP {caller_ip} requires registered axon port {allowed_axon_port}"
-        axon = metagraph.axons[caller_uid]
-        axon_ip = str(getattr(axon, "ip", "") or "").strip()
-        axon_port = int(getattr(axon, "port", 0) or 0)
-        if axon_ip == allowed_ip and axon_port == allowed_axon_port:
-            return True, "OK"
-        return (
-            False,
-            f"Caller axon {axon_ip}:{axon_port} does not match whitelist {allowed_ip}:{allowed_axon_port}",
-        )
-    return False, f"Caller IP {caller_ip} not in whitelist"
 
 
 def _make_wallet(config):
@@ -135,14 +88,44 @@ def _resolve_axon_port(config: typing.Any) -> int:
     return 9000
 
 
-def _make_axon(wallet, port: int):
+def _resolve_external_ip() -> str | None:
+    for key in ("MINER_EXTERNAL_IP", "PUBLIC_IPADDR", "AXON_EXTERNAL_IP"):
+        raw = os.getenv(key)
+        if raw and raw.strip():
+            return raw.strip()
+    return None
+
+
+def _resolve_external_port(bind_port: int) -> int:
+    raw = os.getenv("MINER_EXTERNAL_PORT") or os.getenv("AXON_EXTERNAL_PORT")
+    if raw is not None and str(raw).strip():
+        return int(raw)
+    return int(bind_port)
+
+
+def _make_axon(
+    wallet,
+    port: int,
+    *,
+    external_ip: str | None = None,
+    external_port: int | None = None,
+):
     resolved_port = int(port)
+    kwargs: dict[str, typing.Any] = {
+        "wallet": wallet,
+        "port": resolved_port,
+        "ip": "0.0.0.0",
+    }
+    if external_ip:
+        kwargs["external_ip"] = external_ip
+    if external_port is not None:
+        kwargs["external_port"] = int(external_port)
     if hasattr(bt, "axon"):
-        return bt.axon(wallet=wallet, port=resolved_port)
+        return bt.axon(**kwargs)
     axon_cls = getattr(bt, "Axon", None)
     if axon_cls is None:
         raise RuntimeError("No axon constructor found in bittensor.")
-    return axon_cls(wallet=wallet, port=resolved_port)
+    return axon_cls(**kwargs)
 
 
 def _configure_log_level(level_raw: str) -> None:
@@ -167,21 +150,6 @@ class PerturbMiner:
 
         self.model = load_efficientnet_v2_l(self.device)
         logger.info(f"[MINER] Attack profile: {runtime_profile_summary()}")
-
-        # Validator IP whitelist — disabled until real validator endpoint is confirmed.
-        # Re-enable by uncommenting below and setting MINER_VALIDATOR_IP_WHITELIST, e.g. 63.142.193.28:31711
-        self._validator_ip_whitelist: list[tuple[str, int | None]] = []
-        # whitelist_raw = MINER_VALIDATOR_IP_WHITELIST
-        # if whitelist_raw.lower() in _IP_WHITELIST_DISABLED:
-        #     self._validator_ip_whitelist = []
-        #     logger.warning("[MINER] Validator IP whitelist disabled")
-        # else:
-        #     self._validator_ip_whitelist = _parse_validator_ip_whitelist(whitelist_raw)
-        #     if not self._validator_ip_whitelist:
-        #         raise RuntimeError(
-        #             "MINER_VALIDATOR_IP_WHITELIST is empty; set entries like 63.142.193.28:31711 or 'off' to disable"
-        #         )
-        #     logger.info(f"[MINER] Validator IP whitelist: {whitelist_raw}")
 
         self._save_challenge_images = SAVE_CHALLENGE_IMAGES
         self._challenge_save_dir = Path(CHALLENGE_SAVE_DIR or "data/challenges")
@@ -215,10 +183,18 @@ class PerturbMiner:
             )
 
         axon_port = int(getattr(getattr(self.config, "axon", object()), "port", 9000))
-        self.axon = _make_axon(wallet=self.wallet, port=axon_port)
+        external_ip = getattr(getattr(self.config, "axon", object()), "external_ip", None) or _resolve_external_ip()
+        external_port = getattr(getattr(self.config, "axon", object()), "external_port", None)
+        if external_port is None:
+            external_port = _resolve_external_port(axon_port)
+        self.axon = _make_axon(
+            wallet=self.wallet,
+            port=axon_port,
+            external_ip=external_ip,
+            external_port=int(external_port),
+        )
         self.axon.attach(
             forward_fn=self.forward,
-            blacklist_fn=self.blacklist,
             priority_fn=self.priority,
         )
 
@@ -386,47 +362,6 @@ class PerturbMiner:
         finally:
             self._schedule_challenge_persist_background(synapse, task_id)
 
-    async def blacklist(self, synapse: AttackChallenge) -> typing.Tuple[bool, str]:
-        caller_ip = getattr(getattr(synapse, "dendrite", None), "ip", None)
-        self._log_step_start(
-            "miner_blacklist",
-            task_id=getattr(synapse, "task_id", "unknown"),
-            caller_hotkey=getattr(getattr(synapse, "dendrite", None), "hotkey", None),
-            caller_ip=caller_ip,
-        )
-        if synapse.dendrite is None or synapse.dendrite.hotkey is None:
-            logger.warning("Blacklist reject: missing caller hotkey")
-            return True, "Missing caller hotkey"
-
-        hotkey = synapse.dendrite.hotkey
-        # caller_uid: int | None = None
-        # if hotkey in self.metagraph.hotkeys:
-        #     caller_uid = self.metagraph.hotkeys.index(hotkey)
-
-        # Validator IP whitelist — disabled until real validator endpoint is confirmed.
-        # if self._validator_ip_whitelist:
-        #     allowed, reason = _caller_ip_whitelisted(
-        #         caller_ip=str(caller_ip) if caller_ip else None,
-        #         caller_uid=caller_uid,
-        #         metagraph=self.metagraph,
-        #         whitelist=self._validator_ip_whitelist,
-        #     )
-        #     if not allowed:
-        #         logger.warning(f"Blacklist reject: {reason}")
-        #         return True, reason
-
-        if hotkey not in self.metagraph.hotkeys:
-            logger.warning(f"Blacklist reject: unregistered caller hotkey={hotkey}")
-            return True, "Unregistered caller"
-
-        uid = self.metagraph.hotkeys.index(hotkey)
-        if not self.metagraph.validator_permit[uid]:
-            logger.warning(f"Blacklist reject: caller uid={uid} lacks validator permit")
-            return True, "Caller is not validator"
-
-        logger.info(f"Blacklist allow: caller uid={uid} hotkey={hotkey} ip={caller_ip}")
-        return False, "OK"
-
     async def priority(self, synapse: AttackChallenge) -> float:
         self._log_step_start(
             "miner_priority",
@@ -452,7 +387,9 @@ class PerturbMiner:
 
         logger.info(
             f"Serving miner axon {self.axon} on network: {self.config.subtensor.network} "
-            f"with netuid: {self.config.netuid} axon_port={getattr(self.config.axon, 'port', 'unknown')}"
+            f"with netuid: {self.config.netuid} "
+            f"bind={getattr(self.axon, 'ip', '?')}:{getattr(self.axon, 'port', '?')} "
+            f"announced={getattr(self.axon, 'external_ip', '?')}:{getattr(self.axon, 'external_port', '?')}"
         )
         self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
         self.axon.start()
@@ -483,6 +420,18 @@ def build_config() -> typing.Any:
         type=int,
         default=int(os.getenv("MINER_PORT", os.getenv("AXON_PORT", "9000"))),
     )
+    parser.add_argument(
+        "--axon.external_ip",
+        dest="axon_external_ip",
+        type=str,
+        default=os.getenv("MINER_EXTERNAL_IP", os.getenv("PUBLIC_IPADDR", "")),
+    )
+    parser.add_argument(
+        "--axon.external_port",
+        dest="axon_external_port",
+        type=int,
+        default=int(os.getenv("MINER_EXTERNAL_PORT", os.getenv("MINER_PORT", os.getenv("AXON_PORT", "9000")))),
+    )
 
     if hasattr(bt, "config"):
         config = bt.config(parser)
@@ -508,6 +457,12 @@ def build_config() -> typing.Any:
     if not hasattr(config, "axon"):
         config.axon = type("AxonConfig", (), {})()
     config.axon.port = _resolve_axon_port(config)
+    ext_ip = getattr(config, "axon_external_ip", None) or _resolve_external_ip()
+    config.axon.external_ip = ext_ip if ext_ip else None
+    ext_port_raw = getattr(config, "axon_external_port", None)
+    config.axon.external_port = (
+        int(ext_port_raw) if ext_port_raw is not None else _resolve_external_port(config.axon.port)
+    )
 
     config.log_level = getattr(config, "log_level", os.getenv("LOG_LEVEL", "DEBUG"))
 

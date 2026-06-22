@@ -110,6 +110,15 @@ def parse_args() -> argparse.Namespace:
                    help="Gradient-probe fraction: try top-probe_frac elements as binary search upper bound (0=off)")
     p.add_argument("--restart-batch-size", type=int, default=12,
                    help="Restarts to run in parallel on GPU per sub-batch (default 12; matches first_level_restarts)")
+    # Local-optima escape enhancements
+    p.add_argument("--fgsm-init-slots", type=int, default=2,
+                   help="Level-1 restarts seeded with FGSM/neg-FGSM (0=off; costs one extra fwd+bwd)")
+    p.add_argument("--sign-random-slots", type=int, default=6,
+                   help="Level-1 restarts using random ±eps sign init instead of uniform (0=off)")
+    p.add_argument("--plateau-patience", type=int, default=6,
+                   help="Steps without margin improvement before alpha halved + momentum reset (0=off)")
+    p.add_argument("--ce-loss-slots", type=int, default=6,
+                   help="Trailing restarts per sub-batch using CE loss instead of CW margin (0=off)")
     p.add_argument("--device", type=str, default=None, help="cuda / cpu (auto by default)")
     return p.parse_args()
 
@@ -217,6 +226,10 @@ def main() -> int:
         print(f"probe_frac          : {args.probe_frac} ({'on — gradient-probe tight upper bound' if args.probe_frac > 0 else 'off'})")
         print(f"polish_rounds       : {args.polish_rounds} (backward elimination)")
         print(f"accept_margin       : {args.accept_margin} (lower => more images at 1/255)")
+        print(f"fgsm_init_slots     : {args.fgsm_init_slots} ({'FGSM/neg-FGSM level-1 inits' if args.fgsm_init_slots > 0 else 'off'})")
+        print(f"sign_random_slots   : {args.sign_random_slots} ({'random ±eps level-1 inits' if args.sign_random_slots > 0 else 'off'})")
+        print(f"plateau_patience    : {args.plateau_patience} ({'alpha-halving on plateau' if args.plateau_patience > 0 else 'off'})")
+        print(f"ce_loss_slots       : {args.ce_loss_slots} ({'trailing CE-loss restarts' if args.ce_loss_slots > 0 else 'off — all CW margin'})")
     else:
         print(f"OPS sampling        : neighbor={args.num_sample_neighbor} operator={args.num_sample_operator}")
         print(f"attack_epsilon      : {args.attack_epsilon}")
@@ -257,6 +270,10 @@ def main() -> int:
             accept_margin=args.accept_margin,
             restart_batch_size=args.restart_batch_size,
             probe_frac=args.probe_frac,
+            fgsm_init_slots=args.fgsm_init_slots,
+            sign_random_slots=args.sign_random_slots,
+            plateau_patience=args.plateau_patience,
+            ce_loss_slots=args.ce_loss_slots,
         )
         attack = build_ops_budget_attack(
             device,

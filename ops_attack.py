@@ -266,6 +266,28 @@ class BudgetConfig:
     # it as the tighter upper bound for the binary search (saving ~5 levels ≈ 2s).
     # If it fails, fall back to the full n_active upper bound as before.
     probe_frac: float = 0.05     # top fraction of elements to probe (5% of C*H*W)
+    # ── Diversified init (local-optima escape) ────────────────────────────────
+    # At level 1/255, uniform random inits have mean |δ|=ε/2, under-exploring the
+    # ε-ball boundary where flips live.  Three complementary init strategies:
+    #   FGSM slots: ε×sign(∇L at δ=0) and its negation — gradient-aligned starts
+    #               that cost one extra fwd+bwd call shared across both slots.
+    #   sign-random slots: exactly ±ε per pixel (corners of L∞ ball), not uniform.
+    # Remaining restarts keep existing uniform random behaviour.
+    fgsm_init_slots: int = 2    # leading level-1 restarts seeded with FGSM / neg-FGSM
+    sign_random_slots: int = 6  # next restarts use random ±ε sign (not uniform)
+    # ── Plateau-aware step size scheduling ───────────────────────────────────
+    # If the best margin across a sub-batch fails to improve for `plateau_patience`
+    # consecutive steps, alpha is halved and momentum is reset for all restarts in
+    # that sub-batch.  This lets PGD escape flat regions without extra GPU calls.
+    # 0 = disabled (original fixed-alpha behaviour).
+    plateau_patience: int = 6   # steps without improvement before alpha halved (0=off)
+    # ── Loss diversity across restarts ───────────────────────────────────────
+    # CW margin loss (max_other - true) keeps widening the gap post-flip but has
+    # a flat gradient far from the boundary.  Cross-entropy is steeper in that
+    # regime.  Running the last `ce_loss_slots` restarts in each sub-batch with CE
+    # covers both failure modes at zero extra compute cost.
+    # 0 = disabled (all restarts use CW margin loss as before).
+    ce_loss_slots: int = 6      # trailing restarts per sub-batch that use CE loss
 
 
 def _make_budget_forward(cfg: BudgetConfig):
@@ -337,24 +359,52 @@ def _make_budget_forward(cfg: BudgetConfig):
             ``mask`` (optional, [1,1,H,W]) zeros perturbation outside the model's
             center-crop window — those pixels are invisible to the classifier so
             zeroing them is a free RMSE reduction.
+
+            Three local-optima escape enhancements (all controlled by BudgetConfig):
+              1. Diversified init: FGSM/neg-FGSM slots + random-sign slots alongside
+                 the existing uniform-random restarts.
+              2. Plateau-aware step size: halves alpha + resets momentum when margin
+                 stagnates for `plateau_patience` consecutive steps.
+              3. Loss diversity: trailing `ce_loss_slots` restarts per sub-batch use
+                 cross-entropy loss instead of CW margin loss.
             """
             eps = level * unit
-            alpha = max(eps * cfg.alpha_frac, unit)
+            alpha_base = max(eps * cfg.alpha_frac, unit)
             n_restarts = max(1, int(restarts if restarts is not None else cfg.restarts))
             rbs = max(1, cfg.restart_batch_size)
             idx = int(label1.item())
 
-            # Build all restart initializations upfront
+            # ── Enhancement 1: build diverse restart inits ────────────────────
+            # FGSM init: one shared gradient call at δ=0 (or init if provided).
+            fgsm_slots = int(cfg.fgsm_init_slots) if level == 1 else 0
+            sign_slots = int(cfg.sign_random_slots) if level == 1 else 0
+
+            fgsm_g = None
+            if fgsm_slots > 0 and n_restarts > 1:
+                # One forward+backward to get the single-step best direction.
+                base = init.detach().clamp(-eps, eps) if init is not None else torch.zeros_like(data1)
+                fgsm_g = _grad(data1, label1, base)  # [1,C,H,W]
+
             inits = []
             for r in range(n_restarts):
                 if r == 0 and init is not None:
                     d = init.detach().clamp(-eps, eps).clone()
                 elif r == 0:
                     d = torch.zeros_like(data1)
+                elif fgsm_g is not None and r == 1:
+                    # FGSM: ε × sign(∇L) — gradient-aligned start
+                    d = (eps * fgsm_g.sign()).clamp(-eps, eps)
+                elif fgsm_g is not None and r == 2 and fgsm_slots >= 2:
+                    # neg-FGSM: explore opposite basin
+                    d = (-eps * fgsm_g.sign()).clamp(-eps, eps)
+                elif r < 1 + fgsm_slots + sign_slots:
+                    # random ±ε sign (corners of L∞ ball; mean |δ|=ε, not ε/2)
+                    d = eps * (torch.randint_like(data1, 0, 2) * 2 - 1).float()
                 else:
+                    # existing: uniform random in [-ε, ε]
                     d = torch.empty_like(data1).uniform_(-eps, eps)
-                    if mask is not None:
-                        d = d * mask  # zero outside-crop pixels in random restarts
+                if mask is not None and r > 0:
+                    d = d * mask  # zero outside-crop pixels in non-zero inits
                 inits.append(torch.min(torch.max(d, -data1), 1.0 - data1))
 
             best_delta = None
@@ -368,14 +418,36 @@ def _make_budget_forward(cfg: BudgetConfig):
                 data_b = data1.expand(bs, -1, -1, -1).contiguous()
                 momentum_b = torch.zeros_like(delta_b)
 
-                for _ in range(int(cfg.inner_iters)):
+                # ── Enhancement 2: plateau state per sub-batch ────────────────
+                patience = int(cfg.plateau_patience)
+                alpha = alpha_base
+                prev_best_margin = float("-inf")
+                no_improve_steps = 0
+
+                # ── Enhancement 3: CE loss slot boundary ─────────────────────
+                # Last `ce_loss_slots` restarts in this sub-batch use CE loss.
+                ce_slots = int(cfg.ce_loss_slots)
+                ce_start = max(0, bs - ce_slots)  # index within sub-batch
+
+                for step in range(int(cfg.inner_iters)):
                     d = delta_b.detach().requires_grad_(True)
                     logits = model(torch.clamp(data_b + d, 0.0, 1.0))  # [bs, C]
                     true_logits = logits[:, idx]
-                    other = logits.clone()
-                    other[:, idx] = float("-inf")
-                    # Sum loss so grad[i] == d(margin_i)/d(delta[i]) for each restart
-                    loss = (other.max(dim=1).values - true_logits).sum()
+                    other_logits = logits.clone()
+                    other_logits[:, idx] = float("-inf")
+                    other_max = other_logits.max(dim=1).values
+
+                    # CW margin loss for early restarts; CE for trailing slots
+                    cw_loss = (other_max[:ce_start] - true_logits[:ce_start]).sum()
+                    if ce_start < bs:
+                        # CE: -log(softmax(logits)[true])
+                        ce_loss = torch.nn.functional.cross_entropy(
+                            logits[ce_start:], label1.expand(bs - ce_start)
+                        )
+                        loss = cw_loss + ce_loss * (bs - ce_start)
+                    else:
+                        loss = cw_loss
+
                     grads = torch.autograd.grad(loss, d)[0].detach()  # [bs, C, H, W]
                     # Normalize per restart independently (not across the batch)
                     g_norm = grads / (grads.abs().mean(dim=(1, 2, 3), keepdim=True) + 1e-12)
@@ -385,6 +457,22 @@ def _make_budget_forward(cfg: BudgetConfig):
                     delta_b = torch.min(torch.max(delta_b, -data_b), 1.0 - data_b)
                     if mask is not None:
                         delta_b = delta_b * mask  # enforce zero outside center crop
+
+                    # ── Plateau check: halve alpha + reset momentum if stagnant ─
+                    if patience > 0:
+                        # Proxy: best CW margin across all restarts in sub-batch
+                        with torch.no_grad():
+                            cur_margins = (other_max - true_logits)
+                            step_best = float(cur_margins.max().item())
+                        if step_best > prev_best_margin + 1e-3:
+                            prev_best_margin = step_best
+                            no_improve_steps = 0
+                        else:
+                            no_improve_steps += 1
+                            if no_improve_steps >= patience:
+                                alpha = max(alpha * 0.5, unit * 0.25)
+                                momentum_b = torch.zeros_like(momentum_b)
+                                no_improve_steps = 0
 
                 # Evaluate each restart and track the best
                 for r in range(bs):

@@ -23,10 +23,12 @@ WALLET_HOTKEY="${WALLET_HOTKEY:-}"
 WALLET_HOTKEY_SS58="${WALLET_HOTKEY_SS58:-}"
 NETUID="${NETUID:-1}"
 NETWORK="${NETWORK:-local}"
+MINER_PORT="${MINER_PORT:-8091}"
+MINER_EXTERNAL_IP="${MINER_EXTERNAL_IP:-${PUBLIC_IPADDR:-}}"
+MINER_EXTERNAL_PORT="${MINER_EXTERNAL_PORT:-$MINER_PORT}"
 MINER_EXTRA_ARGS="${MINER_EXTRA_ARGS:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 LOG_LEVEL="${LOG_LEVEL:-DEBUG}"
-MINER_PORT="${MINER_PORT:-9000}"
 
 if [[ -z "$WALLET_NAME" || -z "$WALLET_HOTKEY" ]]; then
   echo "WALLET_NAME and WALLET_HOTKEY must be set in $ENV_FILE"
@@ -59,7 +61,7 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python -m pip install -e .
 
-echo "Miner wallet: name=$WALLET_NAME hotkey=$WALLET_HOTKEY netuid=$NETUID network=$NETWORK port=$MINER_PORT"
+echo "Miner wallet: name=$WALLET_NAME hotkey=$WALLET_HOTKEY netuid=$NETUID network=$NETWORK port=$MINER_PORT announced=${MINER_EXTERNAL_IP:-auto}:${MINER_EXTERNAL_PORT}"
 if [[ -n "$WALLET_HOTKEY_SS58" ]]; then
   echo "Registered hotkey SS58 (reference): $WALLET_HOTKEY_SS58"
 fi
@@ -73,6 +75,8 @@ if [[ "${1:-}" == "--foreground" ]]; then
     --wallet.name "$WALLET_NAME" \
     --wallet.hotkey "$WALLET_HOTKEY" \
     --axon.port "$MINER_PORT" \
+    --axon.external_ip "$MINER_EXTERNAL_IP" \
+    --axon.external_port "$MINER_EXTERNAL_PORT" \
     --log-level "$LOG_LEVEL"
   exit 0
 fi
@@ -89,6 +93,8 @@ pm2 start ".venv/bin/python" --name perturb-miner -- \
   --wallet.name "$WALLET_NAME" \
   --wallet.hotkey "$WALLET_HOTKEY" \
   --axon.port "$MINER_PORT" \
+  --axon.external_ip "$MINER_EXTERNAL_IP" \
+  --axon.external_port "$MINER_EXTERNAL_PORT" \
   --log-level "$LOG_LEVEL"
 pm2 save
 pm2 status perturb-miner
